@@ -40,7 +40,7 @@ func TestConfigWithMethods(t *testing.T) {
 		WithHost("myhost", 1234).
 		WithCredentials("user", "pass").
 		WithVHost("/test").
-		WithHeartbeat(30 * time.Second).
+		WithHeartbeat(30*time.Second).
 		WithReconnect(2*time.Second, 120*time.Second, 5)
 
 	if c.URL != "amqp://user:pass@host:1234/vhost" {

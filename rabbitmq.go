@@ -15,16 +15,16 @@ import (
 
 // Sentinel errors for RabbitMQ operations.
 var (
-	ErrConnectionClosed  = errors.New("rabbitmq: connection closed")
-	ErrChannelClosed     = errors.New("rabbitmq: channel closed")
-	ErrPublishFailed     = errors.New("rabbitmq: publish failed")
-	ErrConsumeFailed     = errors.New("rabbitmq: consume failed")
-	ErrInvalidConfig     = errors.New("rabbitmq: invalid configuration")
-	ErrNotConnected      = errors.New("rabbitmq: not connected")
-	ErrTimeout           = errors.New("rabbitmq: operation timeout")
-	ErrNack              = errors.New("rabbitmq: message was nacked")
-	ErrMaxReconnects     = errors.New("rabbitmq: max reconnection attempts reached")
-	ErrShuttingDown      = errors.New("rabbitmq: shutting down")
+	ErrConnectionClosed = errors.New("rabbitmq: connection closed")
+	ErrChannelClosed    = errors.New("rabbitmq: channel closed")
+	ErrPublishFailed    = errors.New("rabbitmq: publish failed")
+	ErrConsumeFailed    = errors.New("rabbitmq: consume failed")
+	ErrInvalidConfig    = errors.New("rabbitmq: invalid configuration")
+	ErrNotConnected     = errors.New("rabbitmq: not connected")
+	ErrTimeout          = errors.New("rabbitmq: operation timeout")
+	ErrNack             = errors.New("rabbitmq: message was nacked")
+	ErrMaxReconnects    = errors.New("rabbitmq: max reconnection attempts reached")
+	ErrShuttingDown     = errors.New("rabbitmq: shutting down")
 )
 
 // Config holds the RabbitMQ connection configuration.
@@ -181,10 +181,10 @@ func (c Config) reconnectDelay(attempt int) time.Duration {
 
 // Connection manages the RabbitMQ connection with auto-reconnect.
 type Connection struct {
-	config     Config
-	conn       *amqp.Connection
-	mu         sync.RWMutex
-	closed     bool
+	config   Config
+	conn     *amqp.Connection
+	mu       sync.RWMutex
+	closed   bool
 	closeCh  chan struct{}
 	notifyCh chan *amqp.Error
 	log      Logger

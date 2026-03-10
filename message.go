@@ -262,4 +262,3 @@ type MessageHandler func(ctx context.Context, delivery *Delivery) error
 
 // ErrorHandler handles errors.
 type ErrorHandler func(err error)
-

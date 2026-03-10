@@ -208,6 +208,24 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 	return outCh, nil
 }
 
+// waitForReconnect waits for a reconnection signal or context cancellation.
+// Returns true if reconnection was signaled (caller should continue the loop),
+// or false if the loop should exit.
+func (c *Consumer) waitForReconnect(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case _, ok := <-c.reconnectCh:
+		if !ok {
+			return false
+		}
+		if err := c.setupChannel(); err != nil {
+			c.log.Errorf("consumer: failed to re-establish channel: %v", err)
+		}
+		return true
+	}
+}
+
 // consumeLoop runs the consume loop, automatically recovering on reconnection.
 func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 	defer close(outCh)
@@ -218,19 +236,10 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		c.mu.RUnlock()
 
 		if ch == nil {
-			// Wait for reconnection or context cancellation
-			select {
-			case <-ctx.Done():
+			if !c.waitForReconnect(ctx) {
 				return
-			case _, ok := <-c.reconnectCh:
-				if !ok {
-					return
-				}
-				if err := c.setupChannel(); err != nil {
-					c.log.Errorf("consumer: failed to re-establish channel: %v", err)
-				}
-				continue
 			}
+			continue
 		}
 
 		deliveryCh, err := ch.ch.Consume(
@@ -244,58 +253,46 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		)
 		if err != nil {
 			c.log.Errorf("consumer: consume failed: %v, waiting for reconnect", err)
-			// Channel is likely broken — close and nil it so Close() won't hang.
 			_ = ch.Close()
 			c.mu.Lock()
 			c.channel = nil
 			c.mu.Unlock()
-			// Wait for reconnection
-			select {
-			case <-ctx.Done():
+			if !c.waitForReconnect(ctx) {
 				return
-			case _, ok := <-c.reconnectCh:
-				if !ok {
-					return
-				}
-				if setupErr := c.setupChannel(); setupErr != nil {
-					c.log.Errorf("consumer: failed to re-establish channel: %v", setupErr)
-				}
-				continue
 			}
+			continue
 		}
 
 		c.log.Infof("consumer: started consuming from queue %q", c.config.Queue)
 
-		// Forward deliveries until channel closes or context is cancelled
-		channelClosed := false
-		for !channelClosed {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveryCh:
-				if !ok {
-					channelClosed = true
-					c.log.Warnf("consumer: delivery channel closed, waiting for reconnect")
-					break
-				}
-				select {
-				case outCh <- fromDelivery(d):
-				case <-ctx.Done():
-					return
-				}
-			}
+		if !c.forwardDeliveries(ctx, outCh, deliveryCh) {
+			return
 		}
 
-		// Channel closed — wait for connection to recover
+		if !c.waitForReconnect(ctx) {
+			return
+		}
+	}
+}
+
+// forwardDeliveries forwards messages from the AMQP delivery channel to outCh
+// until the delivery channel closes or the context is cancelled.
+// Returns true if the delivery channel closed (caller should reconnect),
+// or false if the context was cancelled (caller should exit).
+func (c *Consumer) forwardDeliveries(ctx context.Context, outCh chan<- *Delivery, deliveryCh <-chan amqp.Delivery) bool {
+	for {
 		select {
 		case <-ctx.Done():
-			return
-		case _, ok := <-c.reconnectCh:
+			return false
+		case d, ok := <-deliveryCh:
 			if !ok {
-				return
+				c.log.Warnf("consumer: delivery channel closed, waiting for reconnect")
+				return true
 			}
-			if err := c.setupChannel(); err != nil {
-				c.log.Errorf("consumer: failed to re-establish channel: %v", err)
+			select {
+			case outCh <- fromDelivery(d):
+			case <-ctx.Done():
+				return false
 			}
 		}
 	}
