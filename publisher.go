@@ -82,16 +82,16 @@ type Return struct {
 
 // Publisher publishes messages to RabbitMQ.
 type Publisher struct {
-	conn         *Connection
-	channel      *Channel
-	config       PublisherConfig
-	confirmCh    chan amqp.Confirmation
-	mu           sync.RWMutex
-	closed       bool
-	reconnectCh  chan struct{}
-	log          Logger
-	onReturn     func(Return)
-	onReturnMu   sync.RWMutex
+	conn        *Connection
+	channel     *Channel
+	config      PublisherConfig
+	confirmCh   chan amqp.Confirmation
+	mu          sync.RWMutex
+	closed      bool
+	reconnectCh chan struct{}
+	log         Logger
+	onReturn    func(Return)
+	onReturnMu  sync.RWMutex
 }
 
 // NewPublisher creates a new publisher.
