@@ -1,36 +1,32 @@
 version: "2"
 
 linters:
-  default: standard
   enable:
     - errcheck
     - govet
     - staticcheck
     - unused
     - ineffassign
+    - misspell
     - gocritic
+    - gocyclo
     - revive
+  settings:
+    gocyclo:
+      min-complexity: 15
+    revive:
+      rules:
+        - name: exported
+          disabled: true
   exclusions:
     rules:
-      # Allow unchecked errors in tests for brevity.
-      - path: _test\.go
-        linters:
+      - linters:
           - errcheck
-      # Allow unused params in tests.
-      - path: _test\.go
-        linters:
-          - revive
-        text: unused-parameter
-      # Allow unused ctx in interface implementations.
-      - linters:
-          - revive
-        text: unused-parameter.*ctx
-      # Allow min/max as parameter names.
-      - linters:
-          - revive
-        text: redefines-builtin-id
-      # Examples prioritize readability over strict error handling.
+        path: _test\.go
       - path: examples/
-        linters:
-          - errcheck
-          - gocritic
+        text: ".*"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
