@@ -1,8 +1,12 @@
 # rabbitwrap
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/KARTIKrocks/rabbitwrap.svg)](https://pkg.go.dev/github.com/KARTIKrocks/rabbitwrap)
-[![CI](https://github.com/KARTIKrocks/rabbitwrap/actions/workflows/ci.yml/badge.svg)](https://github.com/KARTIKrocks/rabbitwrap/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/KARTIKrocks/rabbitwrap)](https://goreportcard.com/report/github.com/KARTIKrocks/rabbitwrap)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/KARTIKrocks/rabbitwrap)](go.mod)
+[![CI](https://github.com/KARTIKrocks/rabbitwrap/actions/workflows/ci.yml/badge.svg)](https://github.com/KARTIKrocks/rabbitwrap/actions/workflows/ci.yml)
+[![GitHub tag](https://img.shields.io/github/v/tag/KARTIKrocks/rabbitwrap)](https://github.com/KARTIKrocks/rabbitwrap/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![codecov](https://codecov.io/gh/KARTIKrocks/rabbitwrap/branch/main/graph/badge.svg)](https://codecov.io/gh/KARTIKrocks/rabbitwrap)
 
 A production-ready RabbitMQ client wrapper for Go with automatic reconnection, publisher confirms, consumer middleware, and a fluent API.
 
