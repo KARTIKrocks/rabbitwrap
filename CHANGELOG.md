@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `connectionURL` now percent-encodes the username, password, and vhost, so
   credentials containing reserved characters (`@`, `:`, `/`, `?`) produce a
   valid AMQP URI.
+- `BatchPublisher.PublishAndClear` no longer drops messages added concurrently
+  while it is publishing; it takes the pending batch atomically and re-queues any
+  unpublished messages if publishing fails partway through.
+- `NotifyReturn` no longer stacks listener goroutines when called more than once;
+  a single per-channel listener dispatches to the latest handler.
 - Guarded against a `sync.WaitGroup` misuse panic during concurrent
   `Consume` / `Close`.
 
