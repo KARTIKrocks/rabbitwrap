@@ -143,7 +143,7 @@ type Consumer struct {
 	config      ConsumerConfig
 	mu          sync.RWMutex
 	closed      bool
-	cancelFn    context.CancelFunc
+	cancelFns   []context.CancelFunc
 	reconnectCh chan struct{}
 	log         Logger
 	handlerWg   sync.WaitGroup
@@ -151,6 +151,9 @@ type Consumer struct {
 
 // NewConsumer creates a new consumer.
 func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
+	if conn == nil {
+		return nil, ErrNilConnection
+	}
 	if config.Queue == "" {
 		return nil, fmt.Errorf("%w: queue is required", ErrInvalidConfig)
 	}
@@ -201,7 +204,7 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 
 	outCh := make(chan *Delivery)
 	ctx, cancel := context.WithCancel(ctx)
-	c.cancelFn = cancel
+	c.cancelFns = append(c.cancelFns, cancel)
 
 	go c.consumeLoop(ctx, outCh)
 
@@ -317,8 +320,19 @@ func (c *Consumer) Consume(ctx context.Context, handler MessageHandler) error {
 
 	errCh := make(chan error, concurrency)
 
+	// Register all handler goroutines with the wait group while holding the
+	// lock and confirming we are not shutting down. CloseWithContext sets
+	// c.closed under the same lock before calling handlerWg.Wait(), so this
+	// guarantees no Add happens concurrently with (or after) Wait.
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrShuttingDown
+	}
+	c.handlerWg.Add(concurrency)
+	c.mu.Unlock()
+
 	for range concurrency {
-		c.handlerWg.Add(1)
 		go func() {
 			defer c.handlerWg.Done()
 			for {
@@ -455,10 +469,10 @@ func (c *Consumer) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.cancelFn != nil {
-		c.cancelFn()
-		c.cancelFn = nil
+	for _, cancel := range c.cancelFns {
+		cancel()
 	}
+	c.cancelFns = nil
 }
 
 // Close closes the consumer. If GracefulShutdown is enabled (default),
@@ -480,9 +494,10 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 
 	c.closed = true
 
-	if c.cancelFn != nil {
-		c.cancelFn()
+	for _, cancel := range c.cancelFns {
+		cancel()
 	}
+	c.cancelFns = nil
 
 	c.conn.unsubscribeReconnect(c.reconnectCh)
 	close(c.reconnectCh)
@@ -531,8 +546,11 @@ func (c *Consumer) IsClosed() bool {
 
 // QueueInfo holds queue information.
 type QueueInfo struct {
-	Name      string
-	Messages  int
+	// Name is the queue name.
+	Name string
+	// Messages is the number of ready messages in the queue.
+	Messages int
+	// Consumers is the number of active consumers on the queue.
 	Consumers int
 }
 

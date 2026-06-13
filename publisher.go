@@ -96,6 +96,10 @@ type Publisher struct {
 
 // NewPublisher creates a new publisher.
 func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) {
+	if conn == nil {
+		return nil, ErrNilConnection
+	}
+
 	p := &Publisher{
 		conn:        conn,
 		config:      config,
@@ -142,25 +146,45 @@ func (p *Publisher) setupChannel() error {
 	onReturn := p.onReturn
 	p.onReturnMu.RUnlock()
 	if onReturn != nil {
-		returnCh := make(chan amqp.Return, 1)
-		ch.ch.NotifyReturn(returnCh)
-		go func() {
-			for r := range returnCh {
-				onReturn(Return{Return: r})
-			}
-		}()
+		registerReturnHandler(ch, onReturn)
 	}
 
 	return nil
 }
 
+// registerReturnHandler wires the broker's returned-message notifications for
+// the given channel to onReturn. The forwarding goroutine exits when the
+// channel is closed (amqp091 closes the notify channel on channel teardown).
+func registerReturnHandler(ch *Channel, onReturn func(Return)) {
+	returnCh := make(chan amqp.Return, 1)
+	ch.ch.NotifyReturn(returnCh)
+	go func() {
+		for r := range returnCh {
+			onReturn(Return{Return: r})
+		}
+	}()
+}
+
 // NotifyReturn registers a handler for undeliverable messages.
 // This is called when the Mandatory or Immediate flags are set and the
-// broker cannot route or deliver the message.
+// broker cannot route or deliver the message. The handler is registered on the
+// currently-open channel immediately (and re-registered on every reconnect), so
+// it takes effect without waiting for a reconnection.
 func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Lock()
 	p.onReturn = handler
 	p.onReturnMu.Unlock()
+
+	if handler == nil {
+		return
+	}
+
+	p.mu.RLock()
+	ch := p.channel
+	p.mu.RUnlock()
+	if ch != nil {
+		registerReturnHandler(ch, handler)
+	}
 }
 
 // handleReconnect re-establishes the publisher channel after connection recovery.
@@ -194,6 +218,10 @@ func (p *Publisher) PublishWithKey(ctx context.Context, routingKey string, msg *
 
 // PublishToExchange publishes a message to a specific exchange with routing key.
 func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey string, msg *Message) error {
+	if msg == nil {
+		return ErrNilMessage
+	}
+
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -264,6 +292,9 @@ func (p *Publisher) PublishJSON(ctx context.Context, v any) error {
 
 // PublishDelayed publishes a message with a delay using TTL and dead letter exchange.
 func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time.Duration) error {
+	if msg == nil {
+		return ErrNilMessage
+	}
 	msg.WithTTL(delay)
 	return p.Publish(ctx, msg)
 }
@@ -403,11 +434,28 @@ func (b *BatchPublisher) Publish(ctx context.Context) error {
 	return nil
 }
 
-// PublishAndClear publishes all messages and clears the batch.
+// PublishAndClear publishes all messages currently in the batch and removes
+// them. It atomically takes ownership of the pending messages, so messages
+// added concurrently (via Add* on another goroutine) are never lost or cleared
+// without being published. If publishing fails partway through, the messages
+// that were not yet published are re-queued ahead of any concurrently-added
+// messages so none are dropped and FIFO order is preserved.
 func (b *BatchPublisher) PublishAndClear(ctx context.Context) error {
-	if err := b.Publish(ctx); err != nil {
-		return err
+	b.mu.Lock()
+	messages := b.messages
+	b.messages = make([]*batchMessage, 0)
+	b.mu.Unlock()
+
+	for i, m := range messages {
+		if err := b.publisher.PublishToExchange(ctx, m.exchange, m.routingKey, m.message); err != nil {
+			b.mu.Lock()
+			remaining := make([]*batchMessage, 0, len(messages)-i+len(b.messages))
+			remaining = append(remaining, messages[i:]...)
+			remaining = append(remaining, b.messages...)
+			b.messages = remaining
+			b.mu.Unlock()
+			return err
+		}
 	}
-	b.Clear()
 	return nil
 }

@@ -26,6 +26,13 @@ Thank you for your interest in contributing!
 go test ./...
 ```
 
+Integration tests are gated behind the `integration` build tag and require a
+running RabbitMQ instance (see `docker-compose.yml` / `make docker-up`):
+
+```bash
+go test -tags=integration ./...
+```
+
 ### Running Linter
 
 ```bash

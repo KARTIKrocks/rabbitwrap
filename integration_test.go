@@ -383,6 +383,94 @@ func TestIntegration_BatchPublish(t *testing.T) {
 	}
 }
 
+// TestIntegration_BatchPublishAndClearConcurrent exercises Add racing with
+// PublishAndClear. With the atomic-swap fix, every message added is published
+// exactly once and none is cleared without being sent. With the previous
+// snapshot-then-Clear implementation, messages added during the publish window
+// were dropped, so the consumer would receive fewer than `total`.
+func TestIntegration_BatchPublishAndClearConcurrent(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(queue).WithAutoAck(true))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const total = 500
+	batch := NewBatchPublisher(pub)
+
+	// Producer continuously adds messages while the main goroutine repeatedly
+	// flushes the batch, so Add races with PublishAndClear.
+	done := make(chan struct{})
+	go func() {
+		// Pace the adds so they interleave with the publish window of
+		// PublishAndClear; without pacing the producer finishes before the
+		// first flush and the race is never exercised.
+		for i := 0; i < total; i++ {
+			batch.Add(NewTextMessage(fmt.Sprintf("msg-%d", i)))
+			time.Sleep(200 * time.Microsecond)
+		}
+		close(done)
+	}()
+
+	producing := true
+	for producing {
+		if err := batch.PublishAndClear(ctx); err != nil {
+			t.Fatalf("PublishAndClear failed: %v", err)
+		}
+		select {
+		case <-done:
+			producing = false
+		default:
+		}
+	}
+	// Final flush for anything added after the last clear observed `done`.
+	if err := batch.PublishAndClear(ctx); err != nil {
+		t.Fatalf("final PublishAndClear failed: %v", err)
+	}
+	if sz := batch.Size(); sz != 0 {
+		t.Fatalf("expected empty batch after final flush, got %d", sz)
+	}
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	received := 0
+	idle := time.NewTimer(10 * time.Second)
+	defer idle.Stop()
+	for received < total {
+		select {
+		case <-deliveryCh:
+			received++
+			if !idle.Stop() {
+				<-idle.C
+			}
+			idle.Reset(10 * time.Second)
+		case <-idle.C:
+			t.Fatalf("timed out: received %d of %d messages (dropped messages?)", received, total)
+		case <-ctx.Done():
+			t.Fatalf("context done: received %d of %d messages", received, total)
+		}
+	}
+}
+
 // --- Consumer Tests ---
 
 func TestIntegration_ConsumeWithHandler(t *testing.T) {

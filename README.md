@@ -179,9 +179,12 @@ err = batch.PublishAndClear(ctx)
 pubConfig := rabbitmq.DefaultPublisherConfig().
     WithConfirmMode(true, 5*time.Second)
 
-publisher, _ := rabbitmq.NewPublisher(conn, pubConfig)
+publisher, err := rabbitmq.NewPublisher(conn, pubConfig)
+if err != nil {
+    log.Fatal(err)
+}
 
-err := publisher.Publish(ctx, msg)
+err = publisher.Publish(ctx, msg)
 if errors.Is(err, rabbitmq.ErrNack) {
     // Message was not acknowledged by broker
 }
@@ -407,6 +410,8 @@ rabbitmq.ErrTimeout           // Operation timeout
 rabbitmq.ErrNack              // Message was nacked
 rabbitmq.ErrMaxReconnects     // Max reconnection attempts reached
 rabbitmq.ErrShuttingDown      // Shutting down
+rabbitmq.ErrNilConnection     // A nil connection was passed to a constructor
+rabbitmq.ErrNilMessage        // A nil message was passed to a publish call
 
 if errors.Is(err, rabbitmq.ErrConnectionClosed) {
     // Handle...
@@ -419,8 +424,8 @@ if errors.Is(err, rabbitmq.ErrConnectionClosed) {
 # Run unit tests
 make test
 
-# Run go vet + golangci-lint + staticcheck
-make check
+# Run go vet + golangci-lint (incl. staticcheck) + tests
+make ci
 
 # Run integration tests (requires Docker)
 make test-integration

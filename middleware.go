@@ -42,7 +42,11 @@ func RecoveryMiddleware(onPanic func(recovered any)) Middleware {
 }
 
 // LoggingMiddleware logs each message processing with its duration.
+// A nil logger is replaced with a no-op logger so the middleware never panics.
 func LoggingMiddleware(logger Logger) Middleware {
+	if logger == nil {
+		logger = nopLogger{}
+	}
 	return func(next MessageHandler) MessageHandler {
 		return func(ctx context.Context, d *Delivery) error {
 			start := time.Now()
@@ -61,8 +65,12 @@ func LoggingMiddleware(logger Logger) Middleware {
 }
 
 // RetryMiddleware retries failed message processing up to maxRetries times
-// with the given delay between attempts.
+// with the given delay between attempts. A negative maxRetries is treated as
+// zero, so the handler always runs at least once.
 func RetryMiddleware(maxRetries int, delay time.Duration) Middleware {
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
 	return func(next MessageHandler) MessageHandler {
 		return func(ctx context.Context, d *Delivery) error {
 			var err error

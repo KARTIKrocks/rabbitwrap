@@ -1,9 +1,28 @@
 package rabbitmq
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
+
+// TestNewConsumerNilConnection ensures NewConsumer returns a typed error
+// instead of panicking when given a nil connection.
+func TestNewConsumerNilConnection(t *testing.T) {
+	_, err := NewConsumer(nil, DefaultConsumerConfig().WithQueue("q"))
+	if !errors.Is(err, ErrNilConnection) {
+		t.Errorf("expected ErrNilConnection, got %v", err)
+	}
+}
+
+// TestNewPublisherNilConnection ensures NewPublisher returns a typed error
+// instead of panicking when given a nil connection.
+func TestNewPublisherNilConnection(t *testing.T) {
+	_, err := NewPublisher(nil, DefaultPublisherConfig())
+	if !errors.Is(err, ErrNilConnection) {
+		t.Errorf("expected ErrNilConnection, got %v", err)
+	}
+}
 
 func TestDefaultConsumerConfig(t *testing.T) {
 	c := DefaultConsumerConfig()
