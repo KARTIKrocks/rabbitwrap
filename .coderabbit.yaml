@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit configuration for rabbitwrap.
+# Docs: https://docs.coderabbit.ai/reference/yaml-template
+language: en-US
+early_access: false
+tone_instructions: >-
+  Be concise and technical. This is a public Go library that wraps RabbitMQ, so
+  prioritize API stability, backward compatibility, concurrency correctness, and
+  clear godoc over stylistic nitpicks.
+
+reviews:
+  # Assertive surfaces more substantive findings — appropriate for a library
+  # whose public API and concurrency guarantees matter to downstream users.
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: false
+  poem: true
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  changed_files_summary: true
+  related_prs: true
+  suggested_labels: true
+  suggested_reviewers: true
+  abort_on_close: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    # Skip generated / non-reviewable files to keep reviews focused.
+    - "!**/*.sum"
+    - "!**/go.work.sum"
+    - "!**/coverage.out"
+    - "!**/coverage.html"
+
+  path_instructions:
+    - path: "**/*.go"
+      instructions: >-
+        This is a public Go library wrapping github.com/rabbitmq/amqp091-go.
+        Flag breaking changes to exported identifiers (functions, types, methods,
+        struct fields, constants) — they affect downstream users. Scrutinize
+        concurrency: goroutine lifecycle and leaks, channel closing, mutex usage,
+        and data races (CI runs with -race). For AMQP specifics, check connection
+        and channel lifecycle, reconnection/recovery logic, message ack/nack/reject
+        correctness, prefetch/QoS handling, and graceful shutdown via context
+        cancellation. Ensure errors are wrapped with context and never silently
+        swallowed. Require godoc comments on all exported identifiers.
+    - path: "**/*_test.go"
+      instructions: >-
+        Verify tests are deterministic and free of races, sleeps, and flaky
+        timing assumptions. Prefer table-driven tests and t.Parallel where safe.
+        Integration tests live behind the `integration` build tag and require a
+        live RabbitMQ; do not flag them for missing mocks.
+    - path: "examples/**"
+      instructions: >-
+        Example code prioritizes clarity for readers. Be lenient on lint-style
+        issues, but still flag misuse of the library API or resource leaks
+        (unclosed connections/channels) that would mislead users.
+
+  tools:
+    # Reuse the repo's existing golangci-lint v2 config (.golangci.yml).
+    golangci-lint:
+      enabled: true
+    # Secret scanning on every PR.
+    gitleaks:
+      enabled: true
+    # Markdown quality for README / CONTRIBUTING / CHANGELOG.
+    markdownlint:
+      enabled: true
+    # GitHub Actions workflow checks.
+    actionlint:
+      enabled: true
+    languagetool:
+      enabled: true
+    yamllint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto
