@@ -177,18 +177,26 @@ func TestDeliveryModes(t *testing.T) {
 	}
 }
 
-// TestWithHeaderNilMap ensures WithHeader/WithHeaders initialize a nil Headers
-// map instead of panicking on a directly-constructed &Message{}.
+// TestWithHeaderNilMap ensures WithHeader and WithHeaders each initialize a nil
+// Headers map instead of panicking on a directly-constructed &Message{}. Each
+// sub-case starts from a fresh &Message{} so both methods exercise the
+// nil-initialization path independently.
 func TestWithHeaderNilMap(t *testing.T) {
-	m := &Message{} // Headers is nil
-	m.WithHeader("k1", "v1").WithHeaders(map[string]any{"k2": "v2"})
+	t.Run("WithHeader initializes nil map", func(t *testing.T) {
+		m := &Message{} // Headers is nil
+		m.WithHeader("k1", "v1")
+		if got := m.Headers["k1"]; got != "v1" {
+			t.Errorf("k1: expected %q, got %v", "v1", got)
+		}
+	})
 
-	if got := m.Headers["k1"]; got != "v1" {
-		t.Errorf("k1: expected %q, got %v", "v1", got)
-	}
-	if got := m.Headers["k2"]; got != "v2" {
-		t.Errorf("k2: expected %q, got %v", "v2", got)
-	}
+	t.Run("WithHeaders initializes nil map", func(t *testing.T) {
+		m := &Message{} // Headers is nil
+		m.WithHeaders(map[string]any{"k2": "v2"})
+		if got := m.Headers["k2"]; got != "v2" {
+			t.Errorf("k2: expected %q, got %v", "v2", got)
+		}
+	})
 }
 
 func TestExchangeTypes(t *testing.T) {

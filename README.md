@@ -183,6 +183,7 @@ publisher, err := rabbitmq.NewPublisher(conn, pubConfig)
 if err != nil {
     log.Fatal(err)
 }
+defer publisher.Close()
 
 err = publisher.Publish(ctx, msg)
 if errors.Is(err, rabbitmq.ErrNack) {

@@ -40,7 +40,7 @@ build:
 	go build ./...
 
 ## Format code
-fmt:
+fmt: setup
 	goimports -w .
 
 ## Run tests with coverage report
