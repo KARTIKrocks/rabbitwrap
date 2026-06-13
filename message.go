@@ -155,12 +155,18 @@ func (m *Message) WithAppID(appID string) *Message {
 
 // WithHeader adds a custom header.
 func (m *Message) WithHeader(key string, value any) *Message {
+	if m.Headers == nil {
+		m.Headers = make(map[string]any)
+	}
 	m.Headers[key] = value
 	return m
 }
 
 // WithHeaders sets multiple headers.
 func (m *Message) WithHeaders(headers map[string]any) *Message {
+	if m.Headers == nil {
+		m.Headers = make(map[string]any)
+	}
 	for k, v := range headers {
 		m.Headers[k] = v
 	}

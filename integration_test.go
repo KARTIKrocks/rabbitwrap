@@ -383,6 +383,161 @@ func TestIntegration_BatchPublish(t *testing.T) {
 	}
 }
 
+// TestIntegration_BatchPublishAndClearConcurrent exercises Add racing with
+// PublishAndClear. With the atomic-swap fix, every message added is published
+// exactly once and none is cleared without being sent. With the previous
+// snapshot-then-Clear implementation, messages added during the publish window
+// were dropped, so the consumer would receive fewer than `total`.
+func TestIntegration_BatchPublishAndClearConcurrent(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(queue).WithAutoAck(true))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const total = 500
+	batch := NewBatchPublisher(pub)
+
+	// Producer continuously adds messages while the main goroutine repeatedly
+	// flushes the batch, so Add races with PublishAndClear.
+	done := make(chan struct{})
+	go func() {
+		// Pace the adds so they interleave with the publish window of
+		// PublishAndClear; without pacing the producer finishes before the
+		// first flush and the race is never exercised.
+		for i := 0; i < total; i++ {
+			batch.Add(NewTextMessage(fmt.Sprintf("msg-%d", i)))
+			time.Sleep(200 * time.Microsecond)
+		}
+		close(done)
+	}()
+
+	producing := true
+	for producing {
+		if err := batch.PublishAndClear(ctx); err != nil {
+			t.Fatalf("PublishAndClear failed: %v", err)
+		}
+		select {
+		case <-done:
+			producing = false
+		default:
+		}
+	}
+	// Final flush for anything added after the last clear observed `done`.
+	if err := batch.PublishAndClear(ctx); err != nil {
+		t.Fatalf("final PublishAndClear failed: %v", err)
+	}
+	if sz := batch.Size(); sz != 0 {
+		t.Fatalf("expected empty batch after final flush, got %d", sz)
+	}
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	// Track each message ID so we can detect both dropped messages (missing IDs)
+	// and double-published messages (duplicate IDs), which a plain count would
+	// miss if one drop and one duplicate cancelled out.
+	seen := make(map[int]bool, total)
+	idle := time.NewTimer(10 * time.Second)
+	defer idle.Stop()
+	for len(seen) < total {
+		select {
+		case d := <-deliveryCh:
+			var id int
+			if _, err := fmt.Sscanf(d.Text(), "msg-%d", &id); err != nil {
+				t.Fatalf("unexpected message body %q: %v", d.Text(), err)
+			}
+			if seen[id] {
+				t.Fatalf("duplicate message id %d (double-published)", id)
+			}
+			seen[id] = true
+			if !idle.Stop() {
+				<-idle.C
+			}
+			idle.Reset(10 * time.Second)
+		case <-idle.C:
+			t.Fatalf("timed out: received %d of %d unique messages (dropped messages?)", len(seen), total)
+		case <-ctx.Done():
+			t.Fatalf("context done: received %d of %d unique messages", len(seen), total)
+		}
+	}
+
+	for i := 0; i < total; i++ {
+		if !seen[i] {
+			t.Errorf("missing message id %d", i)
+		}
+	}
+}
+
+// TestIntegration_PublisherNotifyReturn verifies that a returned (unroutable)
+// message is delivered to the handler set via NotifyReturn, that replacing the
+// handler uses the latest one, and that handlers do not stack (a replaced
+// handler must never fire and a single return is delivered only once).
+func TestIntegration_PublisherNotifyReturn(t *testing.T) {
+	conn := integrationConn(t)
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithMandatory(true))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Set a first handler, then replace it. The first must not stay registered.
+	var firstCalls atomic.Int32
+	pub.NotifyReturn(func(Return) { firstCalls.Add(1) })
+
+	returns := make(chan Return, 4)
+	pub.NotifyReturn(func(r Return) { returns <- r })
+
+	// A mandatory publish to a routing key with no bound queue is unroutable, so
+	// the broker returns it.
+	rk := uniqueQueue(t)
+	if err := pub.PublishToExchange(ctx, "", rk, NewTextMessage("orphan")); err != nil {
+		t.Fatalf("publish failed: %v", err)
+	}
+
+	select {
+	case r := <-returns:
+		if r.RoutingKey != rk {
+			t.Errorf("expected routing key %q, got %q", rk, r.RoutingKey)
+		}
+	case <-ctx.Done():
+		t.Fatal("did not receive returned message")
+	}
+
+	// A stacked listener would deliver the return a second time; the replaced
+	// handler would also fire. Neither must happen.
+	select {
+	case r := <-returns:
+		t.Errorf("received unexpected second return: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := firstCalls.Load(); n != 0 {
+		t.Errorf("replaced handler should not fire, got %d calls", n)
+	}
+}
+
 // --- Consumer Tests ---
 
 func TestIntegration_ConsumeWithHandler(t *testing.T) {

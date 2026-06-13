@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -129,6 +131,119 @@ func TestConnectionURL(t *testing.T) {
 			got := tt.config.connectionURL()
 			if got != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}
+
+// TestConnectionURLEncoding verifies that connectionURL percent-encodes
+// credentials and vhosts so the result is always a valid AMQP URI that
+// round-trips back to the original values via amqp091's own parser (the same
+// parser used when dialing).
+func TestConnectionURLEncoding(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    Config
+		wantUser  string
+		wantPass  string
+		wantHost  string
+		wantPort  int
+		wantVhost string
+		wantTLS   bool
+	}{
+		{
+			name: "reserved characters in credentials",
+			config: Config{
+				Host:     "myhost",
+				Port:     5672,
+				Username: "u$er name",
+				Password: "p@ss:w/rd?x=1",
+				VHost:    "/prod",
+			},
+			wantUser:  "u$er name",
+			wantPass:  "p@ss:w/rd?x=1",
+			wantHost:  "myhost",
+			wantPort:  5672,
+			wantVhost: "prod",
+		},
+		{
+			name: "reserved characters in vhost",
+			config: Config{
+				Host:     "myhost",
+				Port:     5672,
+				Username: "user",
+				Password: "pass",
+				VHost:    "/p@th:with?=chars",
+			},
+			wantUser:  "user",
+			wantPass:  "pass",
+			wantHost:  "myhost",
+			wantPort:  5672,
+			wantVhost: "p@th:with?=chars",
+		},
+		{
+			name: "default root vhost",
+			config: Config{
+				Host:     "localhost",
+				Port:     5672,
+				Username: "guest",
+				Password: "guest",
+				VHost:    "/",
+			},
+			wantUser:  "guest",
+			wantPass:  "guest",
+			wantHost:  "localhost",
+			wantPort:  5672,
+			wantVhost: "/",
+		},
+		{
+			name: "tls scheme with custom port",
+			config: Config{
+				Host:     "rabbit.example.com",
+				Port:     5671,
+				Username: "user",
+				Password: "pass",
+				VHost:    "/prod",
+				TLS:      &tls.Config{},
+			},
+			wantUser:  "user",
+			wantPass:  "pass",
+			wantHost:  "rabbit.example.com",
+			wantPort:  5671,
+			wantVhost: "prod",
+			wantTLS:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := tt.config.connectionURL()
+
+			uri, err := amqp.ParseURI(raw)
+			if err != nil {
+				t.Fatalf("connectionURL() = %q is not a parseable AMQP URI: %v", raw, err)
+			}
+			if uri.Username != tt.wantUser {
+				t.Errorf("username: got %q, want %q (url=%q)", uri.Username, tt.wantUser, raw)
+			}
+			if uri.Password != tt.wantPass {
+				t.Errorf("password: got %q, want %q (url=%q)", uri.Password, tt.wantPass, raw)
+			}
+			if uri.Host != tt.wantHost {
+				t.Errorf("host: got %q, want %q (url=%q)", uri.Host, tt.wantHost, raw)
+			}
+			if uri.Port != tt.wantPort {
+				t.Errorf("port: got %d, want %d (url=%q)", uri.Port, tt.wantPort, raw)
+			}
+			if uri.Vhost != tt.wantVhost {
+				t.Errorf("vhost: got %q, want %q (url=%q)", uri.Vhost, tt.wantVhost, raw)
+			}
+			wantScheme := "amqp"
+			if tt.wantTLS {
+				wantScheme = "amqps"
+			}
+			if uri.Scheme != wantScheme {
+				t.Errorf("scheme: got %q, want %q (url=%q)", uri.Scheme, wantScheme, raw)
 			}
 		})
 	}

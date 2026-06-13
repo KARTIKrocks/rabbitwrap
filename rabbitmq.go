@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -25,6 +28,10 @@ var (
 	ErrNack             = errors.New("rabbitmq: message was nacked")
 	ErrMaxReconnects    = errors.New("rabbitmq: max reconnection attempts reached")
 	ErrShuttingDown     = errors.New("rabbitmq: shutting down")
+	// ErrNilConnection is returned by constructors when given a nil *Connection.
+	ErrNilConnection = errors.New("rabbitmq: nil connection")
+	// ErrNilMessage is returned by publish methods when given a nil *Message.
+	ErrNilMessage = errors.New("rabbitmq: nil message")
 )
 
 // Config holds the RabbitMQ connection configuration.
@@ -149,8 +156,16 @@ func (c Config) connectionURL() string {
 		scheme = "amqps"
 	}
 
-	return fmt.Sprintf("%s://%s:%s@%s:%d%s",
-		scheme, c.Username, c.Password, c.Host, c.Port, c.VHost)
+	// Build the URL via net/url so that the username, password, and vhost are
+	// percent-encoded. A raw fmt.Sprintf breaks for credentials or vhosts that
+	// contain reserved characters such as '@', ':', '/', or '?'.
+	u := &url.URL{
+		Scheme: scheme,
+		User:   url.UserPassword(c.Username, c.Password),
+		Host:   net.JoinHostPort(c.Host, strconv.Itoa(c.Port)),
+		Path:   c.VHost,
+	}
+	return u.String()
 }
 
 // logger returns the configured logger or a no-op logger.
@@ -227,6 +242,13 @@ func (c *Connection) connect() error {
 	amqpConfig := amqp.Config{
 		Heartbeat: c.config.Heartbeat,
 		Locale:    "en_US",
+	}
+
+	// Honor the configured connection timeout for the initial dial and for
+	// every reconnection attempt. Without this, amqp091's default 30s dial
+	// timeout is used and Config.ConnectionTimeout has no effect.
+	if c.config.ConnectionTimeout > 0 {
+		amqpConfig.Dial = amqp.DefaultDial(c.config.ConnectionTimeout)
 	}
 
 	if c.config.TLS != nil {

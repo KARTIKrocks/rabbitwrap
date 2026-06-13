@@ -1,4 +1,4 @@
-GOLANGCI_LINT_VERSION := v2.10.1
+GOLANGCI_LINT_VERSION := v2.11.4
 
 .PHONY: all setup deps test test-v test-integration vet lint build fmt cover clean ci docker-up docker-down
 
@@ -40,8 +40,7 @@ build:
 	go build ./...
 
 ## Format code
-fmt:
-	gofmt -w .
+fmt: setup
 	goimports -w .
 
 ## Run tests with coverage report

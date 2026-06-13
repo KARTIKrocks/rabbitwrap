@@ -96,6 +96,10 @@ type Publisher struct {
 
 // NewPublisher creates a new publisher.
 func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) {
+	if conn == nil {
+		return nil, ErrNilConnection
+	}
+
 	p := &Publisher{
 		conn:        conn,
 		config:      config,
@@ -137,26 +141,39 @@ func (p *Publisher) setupChannel() error {
 		p.mu.Unlock()
 	}
 
-	// Register return handler if set
-	p.onReturnMu.RLock()
-	onReturn := p.onReturn
-	p.onReturnMu.RUnlock()
-	if onReturn != nil {
-		returnCh := make(chan amqp.Return, 1)
-		ch.ch.NotifyReturn(returnCh)
-		go func() {
-			for r := range returnCh {
-				onReturn(Return{Return: r})
-			}
-		}()
-	}
+	// Start a single return listener for this channel. It dispatches to the
+	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
+	// its own listener and handlers cannot stack.
+	p.startReturnListener(ch)
 
 	return nil
 }
 
+// startReturnListener starts the per-channel goroutine that forwards the
+// broker's returned messages to the current onReturn handler. The handler is
+// read at delivery time, so one set later via NotifyReturn takes effect
+// immediately. The goroutine exits when the channel is closed (amqp091 closes
+// the notify channel on channel teardown).
+func (p *Publisher) startReturnListener(ch *Channel) {
+	returnCh := make(chan amqp.Return, 1)
+	ch.ch.NotifyReturn(returnCh)
+	go func() {
+		for r := range returnCh {
+			p.onReturnMu.RLock()
+			handler := p.onReturn
+			p.onReturnMu.RUnlock()
+			if handler != nil {
+				handler(Return{Return: r})
+			}
+		}
+	}()
+}
+
 // NotifyReturn registers a handler for undeliverable messages.
-// This is called when the Mandatory or Immediate flags are set and the
-// broker cannot route or deliver the message.
+// This is called when the Mandatory or Immediate flags are set and the broker
+// cannot route or deliver the message. The handler takes effect immediately on
+// the current channel and persists across reconnects; passing nil disables it.
+// Calling it again simply replaces the handler without stacking listeners.
 func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Lock()
 	p.onReturn = handler
@@ -194,6 +211,10 @@ func (p *Publisher) PublishWithKey(ctx context.Context, routingKey string, msg *
 
 // PublishToExchange publishes a message to a specific exchange with routing key.
 func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey string, msg *Message) error {
+	if msg == nil {
+		return ErrNilMessage
+	}
+
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -264,6 +285,9 @@ func (p *Publisher) PublishJSON(ctx context.Context, v any) error {
 
 // PublishDelayed publishes a message with a delay using TTL and dead letter exchange.
 func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time.Duration) error {
+	if msg == nil {
+		return ErrNilMessage
+	}
 	msg.WithTTL(delay)
 	return p.Publish(ctx, msg)
 }
@@ -403,11 +427,28 @@ func (b *BatchPublisher) Publish(ctx context.Context) error {
 	return nil
 }
 
-// PublishAndClear publishes all messages and clears the batch.
+// PublishAndClear publishes all messages currently in the batch and removes
+// them. It atomically takes ownership of the pending messages, so messages
+// added concurrently (via Add* on another goroutine) are never lost or cleared
+// without being published. If publishing fails partway through, the messages
+// that were not yet published are re-queued ahead of any concurrently-added
+// messages so none are dropped and FIFO order is preserved.
 func (b *BatchPublisher) PublishAndClear(ctx context.Context) error {
-	if err := b.Publish(ctx); err != nil {
-		return err
+	b.mu.Lock()
+	messages := b.messages
+	b.messages = make([]*batchMessage, 0)
+	b.mu.Unlock()
+
+	for i, m := range messages {
+		if err := b.publisher.PublishToExchange(ctx, m.exchange, m.routingKey, m.message); err != nil {
+			b.mu.Lock()
+			remaining := make([]*batchMessage, 0, len(messages)-i+len(b.messages))
+			remaining = append(remaining, messages[i:]...)
+			remaining = append(remaining, b.messages...)
+			b.messages = remaining
+			b.mu.Unlock()
+			return err
+		}
 	}
-	b.Clear()
 	return nil
 }

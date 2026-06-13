@@ -158,6 +158,38 @@ func TestRetryMiddlewareContextCancelled(t *testing.T) {
 	}
 }
 
+// TestRetryMiddlewareNegativeRetries ensures a negative retry count still runs
+// the handler exactly once instead of skipping it entirely (which would ack the
+// message without ever processing it).
+func TestRetryMiddlewareNegativeRetries(t *testing.T) {
+	var attempts atomic.Int32
+
+	wantErr := errors.New("boom")
+	handler := RetryMiddleware(-1, 1*time.Millisecond)(func(_ context.Context, _ *Delivery) error {
+		attempts.Add(1)
+		return wantErr
+	})
+
+	err := handler(context.Background(), &Delivery{Message: &Message{}})
+	if attempts.Load() != 1 {
+		t.Errorf("expected handler to run exactly once, ran %d times", attempts.Load())
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected handler error to propagate, got %v", err)
+	}
+}
+
+// TestLoggingMiddlewareNilLogger ensures a nil logger does not panic.
+func TestLoggingMiddlewareNilLogger(t *testing.T) {
+	handler := LoggingMiddleware(nil)(func(_ context.Context, _ *Delivery) error {
+		return nil
+	})
+
+	if err := handler(context.Background(), &Delivery{Message: &Message{}}); err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+}
+
 // testLogger is a test helper for Logger interface.
 type testLogger struct {
 	onDebugf func(string, ...any)
