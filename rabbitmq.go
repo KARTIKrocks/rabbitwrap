@@ -28,8 +28,10 @@ var (
 	ErrNack             = errors.New("rabbitmq: message was nacked")
 	ErrMaxReconnects    = errors.New("rabbitmq: max reconnection attempts reached")
 	ErrShuttingDown     = errors.New("rabbitmq: shutting down")
-	ErrNilConnection    = errors.New("rabbitmq: nil connection")
-	ErrNilMessage       = errors.New("rabbitmq: nil message")
+	// ErrNilConnection is returned by constructors when given a nil *Connection.
+	ErrNilConnection = errors.New("rabbitmq: nil connection")
+	// ErrNilMessage is returned by publish methods when given a nil *Message.
+	ErrNilMessage = errors.New("rabbitmq: nil message")
 )
 
 // Config holds the RabbitMQ connection configuration.

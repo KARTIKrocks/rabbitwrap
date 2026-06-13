@@ -141,50 +141,43 @@ func (p *Publisher) setupChannel() error {
 		p.mu.Unlock()
 	}
 
-	// Register return handler if set
-	p.onReturnMu.RLock()
-	onReturn := p.onReturn
-	p.onReturnMu.RUnlock()
-	if onReturn != nil {
-		registerReturnHandler(ch, onReturn)
-	}
+	// Start a single return listener for this channel. It dispatches to the
+	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
+	// its own listener and handlers cannot stack.
+	p.startReturnListener(ch)
 
 	return nil
 }
 
-// registerReturnHandler wires the broker's returned-message notifications for
-// the given channel to onReturn. The forwarding goroutine exits when the
-// channel is closed (amqp091 closes the notify channel on channel teardown).
-func registerReturnHandler(ch *Channel, onReturn func(Return)) {
+// startReturnListener starts the per-channel goroutine that forwards the
+// broker's returned messages to the current onReturn handler. The handler is
+// read at delivery time, so one set later via NotifyReturn takes effect
+// immediately. The goroutine exits when the channel is closed (amqp091 closes
+// the notify channel on channel teardown).
+func (p *Publisher) startReturnListener(ch *Channel) {
 	returnCh := make(chan amqp.Return, 1)
 	ch.ch.NotifyReturn(returnCh)
 	go func() {
 		for r := range returnCh {
-			onReturn(Return{Return: r})
+			p.onReturnMu.RLock()
+			handler := p.onReturn
+			p.onReturnMu.RUnlock()
+			if handler != nil {
+				handler(Return{Return: r})
+			}
 		}
 	}()
 }
 
 // NotifyReturn registers a handler for undeliverable messages.
-// This is called when the Mandatory or Immediate flags are set and the
-// broker cannot route or deliver the message. The handler is registered on the
-// currently-open channel immediately (and re-registered on every reconnect), so
-// it takes effect without waiting for a reconnection.
+// This is called when the Mandatory or Immediate flags are set and the broker
+// cannot route or deliver the message. The handler takes effect immediately on
+// the current channel and persists across reconnects; passing nil disables it.
+// Calling it again simply replaces the handler without stacking listeners.
 func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Lock()
 	p.onReturn = handler
 	p.onReturnMu.Unlock()
-
-	if handler == nil {
-		return
-	}
-
-	p.mu.RLock()
-	ch := p.channel
-	p.mu.RUnlock()
-	if ch != nil {
-		registerReturnHandler(ch, handler)
-	}
 }
 
 // handleReconnect re-establishes the publisher channel after connection recovery.

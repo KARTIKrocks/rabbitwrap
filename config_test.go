@@ -167,6 +167,21 @@ func TestConnectionURLEncoding(t *testing.T) {
 			wantVhost: "prod",
 		},
 		{
+			name: "reserved characters in vhost",
+			config: Config{
+				Host:     "myhost",
+				Port:     5672,
+				Username: "user",
+				Password: "pass",
+				VHost:    "/p@th:with?=chars",
+			},
+			wantUser:  "user",
+			wantPass:  "pass",
+			wantHost:  "myhost",
+			wantPort:  5672,
+			wantVhost: "p@th:with?=chars",
+		},
+		{
 			name: "default root vhost",
 			config: Config{
 				Host:     "localhost",
