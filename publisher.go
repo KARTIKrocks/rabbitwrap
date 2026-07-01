@@ -258,7 +258,7 @@ func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey 
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return ErrTimeout
 		}
-		return err
+		return fmt.Errorf("await publish confirmation: %w", err)
 	}
 	if !acked {
 		return ErrNack
