@@ -111,7 +111,7 @@ func TestIntegration_PublishText(t *testing.T) {
 	t.Cleanup(func() { consumer.Close() })
 
 	// Declare queue
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestIntegration_PublishJSON(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestIntegration_PublishWithMessageOptions(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -285,7 +285,7 @@ func TestIntegration_PublishWithoutConfirm(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -332,7 +332,7 @@ func TestIntegration_BatchPublish(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -398,7 +398,7 @@ func TestIntegration_BatchPublishAndClearConcurrent(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -552,7 +552,7 @@ func TestIntegration_ConsumeWithHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -608,7 +608,7 @@ func TestIntegration_ConsumeNack(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -650,7 +650,7 @@ func TestIntegration_ConsumeReject(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -694,7 +694,7 @@ func TestIntegration_ConsumeAutoAck(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -739,7 +739,7 @@ func TestIntegration_ConsumerStop(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -784,7 +784,7 @@ func TestIntegration_ConsumeWithMiddleware(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -832,7 +832,7 @@ func TestIntegration_DeclareAndDeleteQueue(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	info, err := consumer.DeclareQueue(queue, false, false, false, nil)
+	info, err := consumer.DeclareQueue(queue, true, false, false, nil)
 	if err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
@@ -861,7 +861,7 @@ func TestIntegration_DeclareQueueWithConfig(t *testing.T) {
 	t.Cleanup(func() { consumer.Close() })
 
 	qConfig := DefaultQueueConfig(queue).
-		WithDurable(false).
+		WithDurable(true).
 		WithMaxLength(100).
 		WithMessageTTL(30 * time.Second)
 
@@ -887,7 +887,7 @@ func TestIntegration_PurgeQueue(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -928,7 +928,7 @@ func TestIntegration_DeclareExchange(t *testing.T) {
 
 	// Declare exchange using ExchangeConfig
 	exConfig := DefaultExchangeConfig(exchange, ExchangeFanout).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true)
 
 	if err := consumer.DeclareExchange(exConfig); err != nil {
@@ -970,14 +970,14 @@ func TestIntegration_BindUnbindQueue(t *testing.T) {
 
 	// Declare exchange
 	exConfig := DefaultExchangeConfig(exchange, ExchangeDirect).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true)
 	if err := consumer.DeclareExchange(exConfig); err != nil {
 		t.Fatalf("failed to declare exchange: %v", err)
 	}
 
 	// Declare queue
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1007,7 +1007,7 @@ func TestIntegration_BindUnbindExchange(t *testing.T) {
 	// Declare exchanges
 	for _, name := range []string{src, dst} {
 		exConfig := DefaultExchangeConfig(name, ExchangeDirect).
-			WithDurable(false).
+			WithDurable(true).
 			WithAutoDelete(true)
 		if err := consumer.DeclareExchange(exConfig); err != nil {
 			t.Fatalf("failed to declare exchange %s: %v", name, err)
@@ -1039,13 +1039,13 @@ func TestIntegration_TopicExchangeRouting(t *testing.T) {
 	t.Cleanup(func() { consumer.Close() })
 
 	exConfig := DefaultExchangeConfig(exchange, ExchangeTopic).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true)
 	if err := consumer.DeclareExchange(exConfig); err != nil {
 		t.Fatalf("failed to declare exchange: %v", err)
 	}
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1101,7 +1101,7 @@ func TestIntegration_FanoutExchange(t *testing.T) {
 	t.Cleanup(func() { consumer.Close() })
 
 	exConfig := DefaultExchangeConfig(exchange, ExchangeFanout).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true)
 	if err := consumer.DeclareExchange(exConfig); err != nil {
 		t.Fatalf("failed to declare exchange: %v", err)
@@ -1109,7 +1109,7 @@ func TestIntegration_FanoutExchange(t *testing.T) {
 
 	// Declare and bind two queues
 	for _, q := range []string{queue1, queue2} {
-		if _, err := consumer.DeclareQueue(q, false, true, false, nil); err != nil {
+		if _, err := consumer.DeclareQueue(q, true, true, false, nil); err != nil {
 			t.Fatalf("failed to declare queue %s: %v", q, err)
 		}
 		if err := consumer.BindQueue(q, exchange, "", nil); err != nil {
@@ -1178,12 +1178,12 @@ func TestIntegration_DeadLetterQueue(t *testing.T) {
 	pub.DeclareExchange(dlxExchange, ExchangeDirect, false, true, nil)
 
 	// Declare DLQ
-	consumer.DeclareQueue(dlqQueue, false, true, false, nil)
+	consumer.DeclareQueue(dlqQueue, true, true, false, nil)
 	consumer.BindQueue(dlqQueue, dlxExchange, "dead", nil)
 
 	// Declare main queue with DLX and short TTL
 	qConfig := DefaultQueueConfig(mainQueue).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true).
 		WithDeadLetter(dlxExchange, "dead").
 		WithMessageTTL(500 * time.Millisecond)
@@ -1266,7 +1266,7 @@ func TestIntegration_ConsumerClose(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1300,7 +1300,7 @@ func TestIntegration_PublishDelayed(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1351,7 +1351,7 @@ func TestIntegration_ConcurrentPublish(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1418,7 +1418,7 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 	}
 	t.Cleanup(func() { consumer.Close() })
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1473,7 +1473,7 @@ func TestIntegration_GracefulShutdown(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1531,7 +1531,7 @@ func TestIntegration_ForceShutdown(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
-	if _, err := consumer.DeclareQueue(queue, false, true, false, nil); err != nil {
+	if _, err := consumer.DeclareQueue(queue, true, true, false, nil); err != nil {
 		t.Fatalf("failed to declare queue: %v", err)
 	}
 
@@ -1561,14 +1561,14 @@ func TestIntegration_PublishToKeys(t *testing.T) {
 	t.Cleanup(func() { consumer.Close() })
 
 	exConfig := DefaultExchangeConfig(exchange, ExchangeDirect).
-		WithDurable(false).
+		WithDurable(true).
 		WithAutoDelete(true)
 	if err := consumer.DeclareExchange(exConfig); err != nil {
 		t.Fatalf("failed to declare exchange: %v", err)
 	}
 
 	for _, q := range []string{queue1, queue2} {
-		if _, err := consumer.DeclareQueue(q, false, true, false, nil); err != nil {
+		if _, err := consumer.DeclareQueue(q, true, true, false, nil); err != nil {
 			t.Fatalf("failed to declare queue %s: %v", q, err)
 		}
 		if err := consumer.BindQueue(q, exchange, q, nil); err != nil {
@@ -1689,7 +1689,10 @@ func TestIntegration_ConcurrentPublisherConfirms(t *testing.T) {
 	}
 	for got := 0; got < total; {
 		select {
-		case <-deliveryCh:
+		case _, ok := <-deliveryCh:
+			if !ok {
+				t.Fatalf("delivery channel closed early: received %d/%d confirmed messages", got, total)
+			}
 			got++
 		case <-ctx.Done():
 			t.Fatalf("timed out: received %d/%d confirmed messages", got, total)
