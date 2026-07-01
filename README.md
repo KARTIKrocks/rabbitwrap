@@ -175,6 +175,11 @@ err = batch.PublishAndClear(ctx)
 
 ### Publisher Confirms
 
+Confirms are **off by default** — enable them with `WithConfirmMode(true, timeout)`
+when you need delivery guarantees. Each publish then waits on its own broker
+acknowledgement (correlated by delivery tag), so a single confirmed publisher is
+safe to share across concurrent goroutines.
+
 ```go
 pubConfig := rabbitmq.DefaultPublisherConfig().
     WithConfirmMode(true, 5*time.Second)

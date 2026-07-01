@@ -141,6 +141,8 @@ type Consumer struct {
 	conn        *Connection
 	channel     *Channel
 	config      ConsumerConfig
+	serverNamed bool   // config.Queue was empty: declare a fresh server-named queue each setup
+	queue       string // resolved queue name actually consumed from
 	mu          sync.RWMutex
 	closed      bool
 	cancelFns   []context.CancelFunc
@@ -150,17 +152,21 @@ type Consumer struct {
 }
 
 // NewConsumer creates a new consumer.
+//
+// An empty config.Queue is allowed: the consumer declares a private, server-named
+// queue (exclusive, auto-delete) and consumes from it. Read the assigned name
+// with QueueName. Such a queue is re-declared with a new name on reconnect, so if
+// you bind it to an exchange, re-bind after a reconnect.
 func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	if conn == nil {
 		return nil, ErrNilConnection
-	}
-	if config.Queue == "" {
-		return nil, fmt.Errorf("%w: queue is required", ErrInvalidConfig)
 	}
 
 	c := &Consumer{
 		conn:        conn,
 		config:      config,
+		serverNamed: config.Queue == "",
+		queue:       config.Queue,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
 	}
@@ -185,11 +191,34 @@ func (c *Consumer) setupChannel() error {
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
+	queueName := c.config.Queue
+	if c.serverNamed {
+		// No queue named: declare a private, server-named queue that lives and
+		// dies with this connection (exclusive + auto-delete). The previous one
+		// is gone after a reconnect, so re-declare to get a fresh name.
+		q, err := ch.ch.QueueDeclare("", false /*durable*/, true /*autoDelete*/, true /*exclusive*/, false /*noWait*/, nil)
+		if err != nil {
+			_ = ch.Close()
+			return fmt.Errorf("declare server-named queue: %w", err)
+		}
+		queueName = q.Name
+	}
+
 	c.mu.Lock()
 	c.channel = ch
+	c.queue = queueName
 	c.mu.Unlock()
 
 	return nil
+}
+
+// QueueName returns the queue this consumer reads from. When NewConsumer was
+// given an empty queue name, this is the server-assigned name (available after
+// construction).
+func (c *Consumer) QueueName() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.queue
 }
 
 // Start starts consuming messages and returns a delivery channel.
@@ -236,6 +265,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 	for {
 		c.mu.RLock()
 		ch := c.channel
+		queue := c.queue
 		c.mu.RUnlock()
 
 		if ch == nil {
@@ -246,7 +276,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		}
 
 		deliveryCh, err := ch.ch.Consume(
-			c.config.Queue,
+			queue,
 			c.config.ConsumerTag,
 			c.config.AutoAck,
 			c.config.Exclusive,
@@ -266,7 +296,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			continue
 		}
 
-		c.log.Infof("consumer: started consuming from queue %q", c.config.Queue)
+		c.log.Infof("consumer: started consuming from queue %q", queue)
 
 		if !c.forwardDeliveries(ctx, outCh, deliveryCh) {
 			return
