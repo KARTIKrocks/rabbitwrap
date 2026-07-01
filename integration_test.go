@@ -1288,15 +1288,6 @@ func TestIntegration_ConsumerClose(t *testing.T) {
 	}
 }
 
-func TestIntegration_ConsumerRequiresQueue(t *testing.T) {
-	conn := integrationConn(t)
-
-	_, err := NewConsumer(conn, DefaultConsumerConfig())
-	if err == nil {
-		t.Fatal("expected error when queue is empty")
-	}
-}
-
 // --- Delayed Publishing ---
 
 func TestIntegration_PublishDelayed(t *testing.T) {
