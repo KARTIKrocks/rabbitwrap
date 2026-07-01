@@ -1752,3 +1752,95 @@ func TestIntegration_AnonymousServerNamedQueue(t *testing.T) {
 		t.Fatal("timed out waiting for message on anonymous queue")
 	}
 }
+
+// TestIntegration_AnonymousQueueReconnect verifies that an anonymous (server-named)
+// consumer keeps delivering after a reconnect. The original queue is exclusive +
+// auto-delete, so the broker drops it when the connection dies; the consumer must
+// re-declare a fresh server-named queue and resume consuming from it.
+func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
+	conn := integrationConn(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+	if err != nil {
+		t.Fatalf("failed to create consumer with empty queue: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	origName := consumer.QueueName()
+	if origName == "" {
+		t.Fatal("expected a server-assigned queue name for an empty queue config")
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	// Sanity: delivery works before the reconnect.
+	if err := pub.PublishToExchange(ctx, "", origName, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before reconnect: %v", err)
+	}
+	select {
+	case d := <-deliveryCh:
+		if string(d.Body) != "before" {
+			t.Errorf("body = %q, want before", d.Body)
+		}
+		d.Ack(false)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for pre-reconnect message")
+	}
+
+	// Force a reconnect by closing the underlying amqp connection out from under
+	// the wrapper; NotifyClose then drives handleReconnect.
+	conn.mu.RLock()
+	underlying := conn.conn
+	conn.mu.RUnlock()
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	// The consumer re-declares a fresh server-named queue on reconnect, so its
+	// reported name changes from the original. Wait for that to happen.
+	var newName string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := consumer.QueueName(); n != "" && n != origName {
+			newName = n
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if newName == "" {
+		t.Fatal("consumer did not re-declare a new server-named queue after reconnect")
+	}
+
+	// Delivery must resume on the new queue. Retry publishing: there is a brief
+	// window between re-declaration and the consume being re-established.
+	for {
+		if ctx.Err() != nil {
+			t.Fatal("timed out waiting for post-reconnect message")
+		}
+		if err := pub.PublishToExchange(ctx, "", newName, NewTextMessage("after")); err != nil {
+			t.Fatalf("publish after reconnect: %v", err)
+		}
+		select {
+		case d := <-deliveryCh:
+			if string(d.Body) != "after" {
+				t.Errorf("body = %q, want after", d.Body)
+			}
+			d.Ack(false)
+			return
+		case <-time.After(500 * time.Millisecond):
+			// Consume may not be re-established yet; publish again.
+		}
+	}
+}

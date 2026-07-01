@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously all publishes on a confirm-mode publisher shared a single
   `NotifyPublish` channel and each `Publish`/`PublishToExchange` consumed the
   next confirmation off it. With concurrent publishers a call could return based
-  on *another* message's ack/nack — reporting success for a message the broker
+  on _another_ message's ack/nack — reporting success for a message the broker
   never confirmed (or a spurious `ErrNack`/`ErrTimeout`), i.e. silent loss of the
   guarantee confirm mode exists to provide. Each publish now uses its own
   `DeferredConfirmation` (delivery-tag correlated), so a single confirmed

@@ -141,6 +141,8 @@ type Consumer struct {
 	conn        *Connection
 	channel     *Channel
 	config      ConsumerConfig
+	serverNamed bool   // config.Queue was empty: declare a fresh server-named queue each setup
+	queue       string // resolved queue name actually consumed from
 	mu          sync.RWMutex
 	closed      bool
 	cancelFns   []context.CancelFunc
@@ -163,6 +165,8 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	c := &Consumer{
 		conn:        conn,
 		config:      config,
+		serverNamed: config.Queue == "",
+		queue:       config.Queue,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
 	}
@@ -188,9 +192,10 @@ func (c *Consumer) setupChannel() error {
 	}
 
 	queueName := c.config.Queue
-	if queueName == "" {
+	if c.serverNamed {
 		// No queue named: declare a private, server-named queue that lives and
-		// dies with this connection (exclusive + auto-delete).
+		// dies with this connection (exclusive + auto-delete). The previous one
+		// is gone after a reconnect, so re-declare to get a fresh name.
 		q, err := ch.ch.QueueDeclare("", false /*durable*/, true /*autoDelete*/, true /*exclusive*/, false /*noWait*/, nil)
 		if err != nil {
 			_ = ch.Close()
@@ -201,7 +206,7 @@ func (c *Consumer) setupChannel() error {
 
 	c.mu.Lock()
 	c.channel = ch
-	c.config.Queue = queueName
+	c.queue = queueName
 	c.mu.Unlock()
 
 	return nil
@@ -213,7 +218,7 @@ func (c *Consumer) setupChannel() error {
 func (c *Consumer) QueueName() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.config.Queue
+	return c.queue
 }
 
 // Start starts consuming messages and returns a delivery channel.
@@ -260,6 +265,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 	for {
 		c.mu.RLock()
 		ch := c.channel
+		queue := c.queue
 		c.mu.RUnlock()
 
 		if ch == nil {
@@ -270,7 +276,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		}
 
 		deliveryCh, err := ch.ch.Consume(
-			c.config.Queue,
+			queue,
 			c.config.ConsumerTag,
 			c.config.AutoAck,
 			c.config.Exclusive,
@@ -290,7 +296,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			continue
 		}
 
-		c.log.Infof("consumer: started consuming from queue %q", c.config.Queue)
+		c.log.Infof("consumer: started consuming from queue %q", queue)
 
 		if !c.forwardDeliveries(ctx, outCh, deliveryCh) {
 			return
