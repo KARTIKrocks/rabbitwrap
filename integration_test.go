@@ -452,9 +452,17 @@ func TestIntegration_BatchPublishAndClearConcurrent(t *testing.T) {
 		t.Fatalf("failed to start consumer: %v", err)
 	}
 
-	// Track each message ID so we can detect both dropped messages (missing IDs)
-	// and double-published messages (duplicate IDs), which a plain count would
-	// miss if one drop and one duplicate cancelled out.
+	// Every message must arrive exactly once (no drops, no duplicates).
+	collectUniqueMessages(t, ctx, deliveryCh, total)
+}
+
+// collectUniqueMessages drains deliveryCh until `total` uniquely-IDed messages
+// (bodies "msg-<id>") have arrived, then asserts no id is missing. It fails on a
+// duplicate id (double-publish), an idle gap (dropped messages), or ctx
+// cancellation. Tracking ids rather than a plain count catches a drop and a
+// duplicate that would otherwise cancel out.
+func collectUniqueMessages(t *testing.T, ctx context.Context, deliveryCh <-chan *Delivery, total int) {
+	t.Helper()
 	seen := make(map[int]bool, total)
 	idle := time.NewTimer(10 * time.Second)
 	defer idle.Stop()
@@ -1783,15 +1791,7 @@ func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
 	if err := pub.PublishToExchange(ctx, "", origName, NewTextMessage("before")); err != nil {
 		t.Fatalf("publish before reconnect: %v", err)
 	}
-	select {
-	case d := <-deliveryCh:
-		if string(d.Body) != "before" {
-			t.Errorf("body = %q, want before", d.Body)
-		}
-		d.Ack(false)
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for pre-reconnect message")
-	}
+	recvDelivery(t, ctx, deliveryCh, "before")
 
 	// Force a reconnect by closing the underlying amqp connection out from under
 	// the wrapper; NotifyClose then drives handleReconnect.
@@ -1803,33 +1803,63 @@ func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
 	}
 
 	// The consumer re-declares a fresh server-named queue on reconnect, so its
-	// reported name changes from the original. Wait for that to happen.
-	var newName string
+	// reported name changes; then delivery must resume on the new queue.
+	newName := waitForReDeclaredQueue(t, consumer, origName)
+	publishUntilDelivered(t, ctx, pub, deliveryCh, newName, "after")
+}
+
+// recvDelivery waits for one delivery, asserts its body equals want, and acks it.
+// It fails the test if the delivery channel closes early or ctx is cancelled.
+func recvDelivery(t *testing.T, ctx context.Context, deliveryCh <-chan *Delivery, want string) {
+	t.Helper()
+	select {
+	case d, ok := <-deliveryCh:
+		if !ok {
+			t.Fatalf("delivery channel closed before receiving %q", want)
+		}
+		if string(d.Body) != want {
+			t.Errorf("body = %q, want %q", d.Body, want)
+		}
+		d.Ack(false)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %q", want)
+	}
+}
+
+// waitForReDeclaredQueue waits until the consumer reports a new server-named
+// queue name (proof it re-declared after a reconnect) and returns it.
+func waitForReDeclaredQueue(t *testing.T, consumer *Consumer, origName string) string {
+	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if n := consumer.QueueName(); n != "" && n != origName {
-			newName = n
-			break
+			return n
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if newName == "" {
-		t.Fatal("consumer did not re-declare a new server-named queue after reconnect")
-	}
+	t.Fatal("consumer did not re-declare a new server-named queue after reconnect")
+	return ""
+}
 
-	// Delivery must resume on the new queue. Retry publishing: there is a brief
-	// window between re-declaration and the consume being re-established.
+// publishUntilDelivered re-publishes want to queue until a matching delivery
+// arrives, covering the brief window between queue re-declaration and the
+// consume being re-established. It fails the test if ctx expires first.
+func publishUntilDelivered(t *testing.T, ctx context.Context, pub *Publisher, deliveryCh <-chan *Delivery, queue, want string) {
+	t.Helper()
 	for {
 		if ctx.Err() != nil {
-			t.Fatal("timed out waiting for post-reconnect message")
+			t.Fatalf("timed out waiting for %q", want)
 		}
-		if err := pub.PublishToExchange(ctx, "", newName, NewTextMessage("after")); err != nil {
-			t.Fatalf("publish after reconnect: %v", err)
+		if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage(want)); err != nil {
+			t.Fatalf("publish %q: %v", want, err)
 		}
 		select {
-		case d := <-deliveryCh:
-			if string(d.Body) != "after" {
-				t.Errorf("body = %q, want after", d.Body)
+		case d, ok := <-deliveryCh:
+			if !ok {
+				t.Fatalf("delivery channel closed before receiving %q", want)
+			}
+			if string(d.Body) != want {
+				t.Errorf("body = %q, want %q", d.Body, want)
 			}
 			d.Ack(false)
 			return

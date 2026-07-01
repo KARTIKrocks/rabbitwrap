@@ -32,9 +32,9 @@ test-v:
 vet:
 	go vet ./...
 
-## Run golangci-lint
+## Run golangci-lint (includes integration-tagged files)
 lint: setup
-	golangci-lint run ./...
+	golangci-lint run --build-tags=integration ./...
 
 ## Build all packages
 build:

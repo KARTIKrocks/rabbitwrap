@@ -47,7 +47,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
-          args: --timeout=5m
+          args: --timeout=5m --build-tags=integration
 
   integration:
     runs-on: ubuntu-latest
