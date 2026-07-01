@@ -150,12 +150,14 @@ type Consumer struct {
 }
 
 // NewConsumer creates a new consumer.
+//
+// An empty config.Queue is allowed: the consumer declares a private, server-named
+// queue (exclusive, auto-delete) and consumes from it. Read the assigned name
+// with QueueName. Such a queue is re-declared with a new name on reconnect, so if
+// you bind it to an exchange, re-bind after a reconnect.
 func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	if conn == nil {
 		return nil, ErrNilConnection
-	}
-	if config.Queue == "" {
-		return nil, fmt.Errorf("%w: queue is required", ErrInvalidConfig)
 	}
 
 	c := &Consumer{
@@ -185,11 +187,33 @@ func (c *Consumer) setupChannel() error {
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
+	queueName := c.config.Queue
+	if queueName == "" {
+		// No queue named: declare a private, server-named queue that lives and
+		// dies with this connection (exclusive + auto-delete).
+		q, err := ch.ch.QueueDeclare("", false /*durable*/, true /*autoDelete*/, true /*exclusive*/, false /*noWait*/, nil)
+		if err != nil {
+			_ = ch.Close()
+			return fmt.Errorf("declare server-named queue: %w", err)
+		}
+		queueName = q.Name
+	}
+
 	c.mu.Lock()
 	c.channel = ch
+	c.config.Queue = queueName
 	c.mu.Unlock()
 
 	return nil
+}
+
+// QueueName returns the queue this consumer reads from. When NewConsumer was
+// given an empty queue name, this is the server-assigned name (available after
+// construction).
+func (c *Consumer) QueueName() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.config.Queue
 }
 
 // Start starts consuming messages and returns a delivery channel.

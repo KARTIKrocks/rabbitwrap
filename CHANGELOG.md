@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-01
+
+### Fixed
+
+- **Publisher confirms are now correlated per-publish under concurrency.**
+  Previously all publishes on a confirm-mode publisher shared a single
+  `NotifyPublish` channel and each `Publish`/`PublishToExchange` consumed the
+  next confirmation off it. With concurrent publishers a call could return based
+  on *another* message's ack/nack — reporting success for a message the broker
+  never confirmed (or a spurious `ErrNack`/`ErrTimeout`), i.e. silent loss of the
+  guarantee confirm mode exists to provide. Each publish now uses its own
+  `DeferredConfirmation` (delivery-tag correlated), so a single confirmed
+  publisher is safe to share across goroutines. Batch publishing inherits the fix.
+
+### Changed
+
+- **`DefaultPublisherConfig().ConfirmMode` now defaults to `false`** (was `true`).
+  Confirm mode makes every publish block until the broker acknowledges it, which
+  is a surprising default for a general-purpose publisher. Callers that rely on
+  confirms must now opt in explicitly with `WithConfirmMode(true, timeout)`.
+  This is a behavioral change — review any code that constructed a publisher from
+  `DefaultPublisherConfig()` and depended on implicit confirms.
+
+### Added
+
+- `NewConsumer` now accepts an empty queue name: it declares a private,
+  server-named queue (exclusive, auto-delete) and consumes from it. The assigned
+  name is available via the new `Consumer.QueueName()` method. Such a queue is
+  re-declared with a new name on reconnect, so re-bind after a reconnect if you
+  bound it to an exchange.
+
 ## [0.2.0] - 2026-06-13
 
 ### Added

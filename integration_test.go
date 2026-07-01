@@ -1636,3 +1636,119 @@ func TestIntegration_IsHealthy(t *testing.T) {
 		t.Fatal("expected unhealthy after close")
 	}
 }
+
+// TestIntegration_ConcurrentPublisherConfirms is the regression test for the
+// confirm-correlation bug: with many goroutines publishing on one confirmed
+// publisher, every publish must wait on its OWN broker ack (not another
+// publish's), and every message must arrive. The previous shared-channel
+// implementation could return success for a message the broker never confirmed,
+// leaving the count short here.
+func TestIntegration_ConcurrentPublisherConfirms(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(queue).WithAutoAck(true))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	if _, err := consumer.DeclareQueue(queue, false /*durable*/, true /*autoDelete*/, true /*exclusive*/, nil); err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue).WithConfirmMode(true, 5*time.Second))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	const goroutines, perGoroutine = 20, 25
+	total := goroutines * perGoroutine
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				if err := pub.Publish(ctx, NewTextMessage(fmt.Sprintf("g%d-i%d", g, i))); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		t.Fatalf("concurrent confirmed publish returned an error: %v", firstErr)
+	}
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+	for got := 0; got < total; {
+		select {
+		case <-deliveryCh:
+			got++
+		case <-ctx.Done():
+			t.Fatalf("timed out: received %d/%d confirmed messages", got, total)
+		}
+	}
+}
+
+// TestIntegration_AnonymousServerNamedQueue covers consuming from a queue with an
+// empty name: the consumer declares a private, server-named queue and reports the
+// assigned name via QueueName.
+func TestIntegration_AnonymousServerNamedQueue(t *testing.T) {
+	conn := integrationConn(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+	if err != nil {
+		t.Fatalf("failed to create consumer with empty queue: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	qn := consumer.QueueName()
+	if qn == "" {
+		t.Fatal("expected a server-assigned queue name for an empty queue config")
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	// The default exchange routes to a queue by its name.
+	if err := pub.PublishToExchange(ctx, "", qn, NewTextMessage("hi")); err != nil {
+		t.Fatalf("publish to anonymous queue: %v", err)
+	}
+
+	select {
+	case d := <-deliveryCh:
+		if string(d.Body) != "hi" {
+			t.Errorf("body = %q, want hi", d.Body)
+		}
+		d.Ack(false)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for message on anonymous queue")
+	}
+}

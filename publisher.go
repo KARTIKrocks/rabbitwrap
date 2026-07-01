@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -31,13 +32,17 @@ type PublisherConfig struct {
 }
 
 // DefaultPublisherConfig returns a default publisher configuration.
+//
+// ConfirmMode defaults to false: publisher confirms make every publish block
+// until the broker acknowledges it, which most callers do not want by default.
+// Opt in with WithConfirmMode(true, timeout) when you need delivery guarantees.
 func DefaultPublisherConfig() PublisherConfig {
 	return PublisherConfig{
 		Exchange:       "",
 		RoutingKey:     "",
 		Mandatory:      false,
 		Immediate:      false,
-		ConfirmMode:    true,
+		ConfirmMode:    false,
 		ConfirmTimeout: 5 * time.Second,
 	}
 }
@@ -85,7 +90,6 @@ type Publisher struct {
 	conn        *Connection
 	channel     *Channel
 	config      PublisherConfig
-	confirmCh   chan amqp.Confirmation
 	mu          sync.RWMutex
 	closed      bool
 	reconnectCh chan struct{}
@@ -125,21 +129,18 @@ func (p *Publisher) setupChannel() error {
 	}
 
 	if p.config.ConfirmMode {
+		// Put the channel into confirm mode. Each publish then obtains its own
+		// deferred confirmation (see PublishToExchange) instead of racing on a
+		// shared NotifyPublish channel, so confirms stay correlated to their
+		// publish under concurrent callers.
 		if err := ch.ch.Confirm(false); err != nil {
 			_ = ch.Close()
 			return fmt.Errorf("failed to enable confirm mode: %w", err)
 		}
-		confirmCh := make(chan amqp.Confirmation, 1)
-		ch.ch.NotifyPublish(confirmCh)
-		p.mu.Lock()
-		p.confirmCh = confirmCh
-		p.channel = ch
-		p.mu.Unlock()
-	} else {
-		p.mu.Lock()
-		p.channel = ch
-		p.mu.Unlock()
 	}
+	p.mu.Lock()
+	p.channel = ch
+	p.mu.Unlock()
 
 	// Start a single return listener for this channel. It dispatches to the
 	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
@@ -221,7 +222,6 @@ func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey 
 		return ErrShuttingDown
 	}
 	ch := p.channel
-	confirmCh := p.confirmCh
 	p.mu.RUnlock()
 
 	if ch == nil {
@@ -230,32 +230,39 @@ func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey 
 
 	publishing := msg.toPublishing()
 
-	err := ch.ch.PublishWithContext(
-		ctx,
-		exchange,
-		routingKey,
-		p.config.Mandatory,
-		p.config.Immediate,
-		publishing,
-	)
+	if !p.config.ConfirmMode {
+		if err := ch.ch.PublishWithContext(ctx, exchange, routingKey, p.config.Mandatory, p.config.Immediate, publishing); err != nil {
+			return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+		}
+		return nil
+	}
+
+	// Confirm mode: obtain a deferred confirmation so this publish waits on its
+	// OWN broker acknowledgement, correlated by delivery tag. This is safe under
+	// concurrent publishers — unlike a shared NotifyPublish channel, where each
+	// waiter could otherwise consume another publish's ack/nack.
+	dc, err := ch.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, p.config.Mandatory, p.config.Immediate, publishing)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
 	}
 
-	// Wait for confirmation if enabled
-	if p.config.ConfirmMode && confirmCh != nil {
-		select {
-		case confirm := <-confirmCh:
-			if !confirm.Ack {
-				return ErrNack
-			}
-		case <-time.After(p.config.ConfirmTimeout):
-			return ErrTimeout
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	waitCtx := ctx
+	if p.config.ConfirmTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, p.config.ConfirmTimeout)
+		defer cancel()
 	}
-
+	acked, err := dc.WaitContext(waitCtx)
+	if err != nil {
+		// Distinguish our own confirm-timeout from caller cancellation.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return ErrTimeout
+		}
+		return err
+	}
+	if !acked {
+		return ErrNack
+	}
 	return nil
 }
 

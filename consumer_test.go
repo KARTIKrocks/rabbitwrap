@@ -220,8 +220,8 @@ func TestDefaultPublisherConfig(t *testing.T) {
 	if c.RoutingKey != "" {
 		t.Errorf("expected empty routing key, got %s", c.RoutingKey)
 	}
-	if !c.ConfirmMode {
-		t.Error("expected confirm mode true")
+	if c.ConfirmMode {
+		t.Error("expected confirm mode false by default")
 	}
 	if c.ConfirmTimeout != 5*time.Second {
 		t.Errorf("expected confirm timeout 5s, got %s", c.ConfirmTimeout)
