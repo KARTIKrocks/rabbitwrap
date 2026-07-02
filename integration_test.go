@@ -1321,29 +1321,31 @@ func TestIntegration_PublishDelayed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	msg := NewTextMessage("delayed")
-	if err := pub.PublishDelayed(ctx, msg, 100*time.Millisecond); err != nil {
-		t.Fatalf("failed to publish delayed: %v", err)
-	}
-
-	// Message should have expiration set
-	if msg.Expiration != "100" {
-		t.Errorf("expected expiration '100', got %s", msg.Expiration)
-	}
-
 	deliveryCh, err := consumer.Start(ctx)
 	if err != nil {
 		t.Fatalf("failed to start consumer: %v", err)
 	}
 
+	// A sub-rung delay is rounded up to the smallest ladder rung (1s), so the
+	// message must not arrive before roughly that long.
+	start := time.Now()
+	msg := NewTextMessage("delayed")
+	if err := pub.PublishDelayed(ctx, msg, 100*time.Millisecond); err != nil {
+		t.Fatalf("failed to publish delayed: %v", err)
+	}
+
 	select {
 	case d := <-deliveryCh:
+		elapsed := time.Since(start)
+		if elapsed < 900*time.Millisecond {
+			t.Errorf("message delivered after %s, expected it to be delayed ~1s", elapsed)
+		}
 		if d.Text() != "delayed" {
 			t.Errorf("expected 'delayed', got %q", d.Text())
 		}
 		d.Ack(false)
 	case <-ctx.Done():
-		t.Fatal("timed out")
+		t.Fatal("timed out waiting for delayed message")
 	}
 }
 

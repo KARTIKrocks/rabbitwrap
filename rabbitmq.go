@@ -32,6 +32,9 @@ var (
 	ErrNilConnection = errors.New("rabbitmq: nil connection")
 	// ErrNilMessage is returned by publish methods when given a nil *Message.
 	ErrNilMessage = errors.New("rabbitmq: nil message")
+	// ErrDelayTooLong is returned by PublishDelayed when the requested delay
+	// exceeds the largest rung of the delay ladder (see DelayLadder).
+	ErrDelayTooLong = errors.New("rabbitmq: delay exceeds maximum supported delay")
 )
 
 // Config holds the RabbitMQ connection configuration.
