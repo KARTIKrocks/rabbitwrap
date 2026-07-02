@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-02
+
+### Fixed
+
+- **`PublishDelayed` now actually delays delivery.** Previously it set a
+  per-message TTL and published straight to the destination, so the message was
+  either consumed immediately (no delay) or, if unconsumed, expired and was
+  silently dropped — the documented "TTL and dead letter exchange" mechanism was
+  half-implemented (the DLX was missing). It now publishes into a dedicated
+  holding queue whose queue-level TTL equals the delay and whose dead-letter
+  exchange/routing key point at the real destination; the message is
+  dead-lettered onward when its TTL expires. Using a queue-level TTL (one holding
+  queue per delay rung) avoids the head-of-line blocking that per-message TTL
+  suffers. Idle holding queues are auto-deleted by the broker (`x-expires`).
+  Verified against RabbitMQ 3.13 and 4.3; requires no broker plugin.
+- `PublishDelayed` no longer mutates the caller's `*Message` (it previously
+  rewrote the message's `Expiration`).
+
+### Added
+
+- `DelayLadder()` returns the fixed set of delays supported by `PublishDelayed`
+  (1s, 5s, 10s, 30s, 1m, 5m, 15m, 30m, 1h). A requested delay is rounded **up**
+  to the nearest rung so a message is never delivered early, keeping the number
+  of holding queues on the broker bounded.
+- `ErrDelayTooLong` sentinel error, returned by `PublishDelayed` when the
+  requested delay exceeds the largest ladder rung.
+
+### Changed
+
+- **`PublishDelayed` delay semantics.** A requested delay is now rounded up to
+  the nearest `DelayLadder()` rung (minimum 1s); a delay `<= 0` publishes
+  immediately, and a delay above the largest rung returns `ErrDelayTooLong`.
+  Delivery timing is best-effort (at or shortly after the target, never before),
+  suitable for retry backoff rather than precise scheduling.
+
 ## [0.3.0] - 2026-07-01
 
 ### Fixed

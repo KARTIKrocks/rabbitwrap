@@ -2,6 +2,8 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -290,13 +292,128 @@ func (p *Publisher) PublishJSON(ctx context.Context, v any) error {
 	return p.Publish(ctx, msg)
 }
 
-// PublishDelayed publishes a message with a delay using TTL and dead letter exchange.
+// delayLadder is the fixed set of delays supported by PublishDelayed. A
+// requested delay is rounded UP to the nearest rung, so a message is never
+// delivered earlier than requested. Delays longer than the largest rung are
+// rejected with ErrDelayTooLong. The ladder is fixed (rather than accepting
+// arbitrary durations) so that the number of holding queues on the broker is
+// bounded — one per (exchange, routing key, rung) — instead of unbounded.
+var delayLadder = []time.Duration{
+	1 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	30 * time.Minute,
+	1 * time.Hour,
+}
+
+// DelayLadder returns a copy of the delay rungs supported by PublishDelayed.
+func DelayLadder() []time.Duration {
+	return append([]time.Duration(nil), delayLadder...)
+}
+
+// snapDelay rounds a requested delay up to the nearest ladder rung.
+func snapDelay(delay time.Duration) (time.Duration, error) {
+	for _, rung := range delayLadder {
+		if delay <= rung {
+			return rung, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: %s (max %s)", ErrDelayTooLong, delay, delayLadder[len(delayLadder)-1])
+}
+
+// delayQueueName builds the deterministic name of the holding queue for a given
+// destination and delay. The destination is hashed so the name stays within
+// length limits and is safe regardless of the characters in the exchange or
+// routing key, while remaining stable across calls (so the queue is reused).
+func delayQueueName(exchange, routingKey string, delay time.Duration) string {
+	h := sha256.Sum256([]byte(exchange + "\x00" + routingKey))
+	return fmt.Sprintf("rabbitwrap.delay.%d.%s", delay.Milliseconds(), hex.EncodeToString(h[:8]))
+}
+
+// PublishDelayed publishes a message that is delivered to the publisher's
+// configured exchange and routing key only after the given delay.
+//
+// It works without any broker plugin: the message is published into a dedicated
+// holding queue whose queue-level TTL equals the delay and whose dead-letter
+// exchange/routing key point at the real destination. When the message's TTL
+// expires it is dead-lettered onward. Using a queue-level TTL (one holding queue
+// per delay rung) avoids the head-of-line blocking that per-message TTL suffers.
+//
+// The delay is rounded up to the nearest rung of DelayLadder so it is never
+// delivered early; delays above the largest rung return ErrDelayTooLong, and a
+// delay <= 0 publishes immediately. Idle holding queues are auto-deleted by the
+// broker (x-expires) once no longer in use.
+//
+// Timing is best-effort: delivery fires at or shortly after the target, never
+// before, with some jitter under broker load. It is suitable for retry backoff,
+// not for precise scheduling. Dead-lettering does not honor the Mandatory flag,
+// so a message routed to a destination with no queue is dropped on expiry.
 func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time.Duration) error {
 	if msg == nil {
 		return ErrNilMessage
 	}
-	msg.WithTTL(delay)
-	return p.Publish(ctx, msg)
+	if delay <= 0 {
+		return p.Publish(ctx, msg)
+	}
+
+	snapped, err := snapDelay(delay)
+	if err != nil {
+		return err
+	}
+
+	exchange := p.config.Exchange
+	routingKey := p.config.RoutingKey
+	queueName := delayQueueName(exchange, routingKey, snapped)
+
+	if err := p.declareDelayQueue(queueName, exchange, routingKey, snapped); err != nil {
+		return err
+	}
+
+	// Publish into the holding queue via the default exchange, which routes by
+	// queue name. On TTL expiry the broker dead-letters the message to the real
+	// destination configured on the queue.
+	return p.PublishToExchange(ctx, "", queueName, msg)
+}
+
+// declareDelayQueue idempotently declares the holding queue for PublishDelayed.
+// Re-declaring on every publish also resets the queue's idle-expiry timer, so an
+// actively used delay queue stays alive while unused ones are reaped.
+func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, delay time.Duration) error {
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return ErrShuttingDown
+	}
+	ch := p.channel
+	p.mu.RUnlock()
+
+	if ch == nil {
+		return ErrChannelClosed
+	}
+
+	// x-expires must comfortably exceed the message TTL, otherwise the broker
+	// could delete the queue (and any in-flight message) before it is
+	// dead-lettered.
+	expires := delay * 2
+	if minExpires := delay + 30*time.Second; expires < minExpires {
+		expires = minExpires
+	}
+
+	args := amqp.Table{
+		"x-message-ttl":             delay.Milliseconds(),
+		"x-dead-letter-exchange":    dlExchange,
+		"x-dead-letter-routing-key": dlRoutingKey,
+		"x-expires":                 expires.Milliseconds(),
+	}
+
+	if _, err := ch.ch.QueueDeclare(name, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, args); err != nil {
+		return fmt.Errorf("%w: declare delay queue: %v", ErrPublishFailed, err)
+	}
+	return nil
 }
 
 // DeclareExchange declares an exchange.
