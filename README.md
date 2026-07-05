@@ -329,11 +329,11 @@ consConfig := rabbitmq.DefaultConsumerConfig().
 
 #### Built-in Middleware
 
-| Middleware | Description |
-|---|---|
-| `LoggingMiddleware(logger)` | Logs message processing with duration |
-| `RecoveryMiddleware(onPanic)` | Recovers from panics in handlers |
-| `RetryMiddleware(maxRetries, delay)` | Retries failed message processing |
+| Middleware                           | Description                           |
+| ------------------------------------ | ------------------------------------- |
+| `LoggingMiddleware(logger)`          | Logs message processing with duration |
+| `RecoveryMiddleware(onPanic)`        | Recovers from panics in handlers      |
+| `RetryMiddleware(maxRetries, delay)` | Retries failed message processing     |
 
 #### Custom Middleware
 
