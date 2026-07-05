@@ -68,6 +68,11 @@ type ConsumerConfig struct {
 	// Bindings are applied to the consumed queue on every channel setup,
 	// initially and after each reconnect.
 	Bindings []BindingConfig
+
+	// DeadLetter, when set, declares a dead-letter exchange, queue, and binding
+	// and wires the work queue to dead-letter into it — on every channel setup,
+	// initially and after each reconnect. Set it with WithDeadLetterQueue.
+	DeadLetter *DeadLetterConfig
 }
 
 // DefaultConsumerConfig returns a default consumer configuration.
@@ -175,6 +180,34 @@ func (c ConsumerConfig) WithBinding(exchange, routingKey string, args map[string
 	return c
 }
 
+// WithDeadLetterQueue returns a new config that declares a dead-letter exchange,
+// a dead-letter queue, and their binding, and wires the work queue to
+// dead-letter into that exchange — all on every channel setup, so the topology
+// survives reconnects and broker restarts. It is the one-call equivalent of
+// hand-declaring the DLX, the DLQ, the binding, and the work queue's
+// x-dead-letter-exchange argument.
+//
+// The work queue must be consumer-declared: if no QueueConfig is set, one is
+// synthesized from the queue name (which must therefore be non-empty). Consume
+// the dead-letter queue like any other queue using its name (see
+// DeadLetterQueueName or dl.Queue).
+func (c ConsumerConfig) WithDeadLetterQueue(dl DeadLetterConfig) ConsumerConfig {
+	c.DeadLetter = &dl
+
+	// The work queue must carry x-dead-letter-exchange, which requires it to be
+	// consumer-declared. Synthesize a QueueConfig from the queue name if needed.
+	qc := DefaultQueueConfig(c.Queue)
+	if c.QueueConfig != nil {
+		qc = *c.QueueConfig
+	}
+	qc.DeadLetterExchange = dl.Exchange
+	qc.DeadLetterRoutingKey = dl.RoutingKey
+	c.QueueConfig = &qc
+	c.Queue = qc.Name
+
+	return c
+}
+
 // Consumer consumes messages from RabbitMQ.
 type Consumer struct {
 	conn        *Connection
@@ -277,6 +310,12 @@ func (c *Consumer) setupChannel() error {
 // applyTopology declares the configured queue and applies the configured
 // bindings on the given channel, returning the resolved queue name.
 func (c *Consumer) applyTopology(ch *Channel) (string, error) {
+	// Declare the dead-letter topology first so the work queue's
+	// x-dead-letter-exchange target exists before the work queue is declared.
+	if err := c.applyDeadLetter(ch); err != nil {
+		return "", err
+	}
+
 	queueName := c.config.Queue
 
 	switch {
@@ -307,6 +346,34 @@ func (c *Consumer) applyTopology(ch *Channel) (string, error) {
 	return queueName, nil
 }
 
+// applyDeadLetter idempotently declares the configured dead-letter exchange,
+// dead-letter queue, and the binding between them. It is a no-op when no
+// DeadLetterConfig is set.
+func (c *Consumer) applyDeadLetter(ch *Channel) error {
+	if c.config.DeadLetter == nil {
+		return nil
+	}
+	dl := c.config.DeadLetter
+
+	kind := dl.ExchangeType
+	if kind == "" {
+		kind = ExchangeFanout
+	}
+	if err := ch.ch.ExchangeDeclare(dl.Exchange, string(kind), dl.Durable, false /*autoDelete*/, false /*internal*/, false /*noWait*/, nil); err != nil {
+		return fmt.Errorf("declare dead-letter exchange %q: %w", dl.Exchange, err)
+	}
+
+	if _, err := ch.ch.QueueDeclare(dl.Queue, dl.Durable, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, amqp.Table(dl.buildArgs())); err != nil {
+		return fmt.Errorf("declare dead-letter queue %q: %w", dl.Queue, err)
+	}
+
+	if err := ch.ch.QueueBind(dl.Queue, dl.RoutingKey, dl.Exchange, false /*noWait*/, nil); err != nil {
+		return fmt.Errorf("bind dead-letter queue %q to exchange %q: %w", dl.Queue, dl.Exchange, err)
+	}
+
+	return nil
+}
+
 // QueueName returns the queue this consumer reads from. When NewConsumer was
 // given an empty queue name, this is the server-assigned name (available after
 // construction).
@@ -314,6 +381,16 @@ func (c *Consumer) QueueName() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.queue
+}
+
+// DeadLetterQueueName returns the name of the dead-letter queue configured with
+// WithDeadLetterQueue, or "" if none was configured. Use it to consume or
+// inspect dead-lettered messages.
+func (c *Consumer) DeadLetterQueueName() string {
+	if c.config.DeadLetter == nil {
+		return ""
+	}
+	return c.config.DeadLetter.Queue
 }
 
 // Start starts consuming messages and returns a delivery channel.
@@ -715,6 +792,104 @@ type BindingConfig struct {
 
 	// Args are additional binding arguments.
 	Args map[string]any
+}
+
+// DeadLetterConfig describes the dead-letter topology declared alongside a
+// consumer's work queue (see ConsumerConfig.WithDeadLetterQueue): a dead-letter
+// exchange, a dead-letter queue, and the binding between them. It is declared
+// idempotently on every channel setup, so it survives reconnects and broker
+// restarts.
+type DeadLetterConfig struct {
+	// Exchange is the dead-letter exchange (DLX) name.
+	Exchange string
+
+	// ExchangeType is the DLX type (default: fanout).
+	ExchangeType ExchangeType
+
+	// Queue is the dead-letter queue (DLQ) name.
+	Queue string
+
+	// RoutingKey routes the work queue's rejected messages to the DLX and binds
+	// the DLQ to it (default: "", which suits a fanout DLX).
+	RoutingKey string
+
+	// Durable sets the DLX and DLQ durability (default: true).
+	Durable bool
+
+	// Quorum declares the DLQ as a quorum queue.
+	Quorum bool
+
+	// MaxLength caps the number of messages in the DLQ (0 = unbounded).
+	MaxLength int
+
+	// MessageTTL expires DLQ entries after the given duration (0 = never).
+	MessageTTL time.Duration
+}
+
+// DefaultDeadLetterConfig returns a dead-letter config for the given work queue,
+// deriving "<workQueue>.dlx" and "<workQueue>.dlq" names, a durable fanout DLX,
+// and a durable DLQ.
+func DefaultDeadLetterConfig(workQueue string) DeadLetterConfig {
+	return DeadLetterConfig{
+		Exchange:     workQueue + ".dlx",
+		ExchangeType: ExchangeFanout,
+		Queue:        workQueue + ".dlq",
+		Durable:      true,
+	}
+}
+
+// WithExchange returns a new config with the specified DLX name and type.
+func (c DeadLetterConfig) WithExchange(name string, kind ExchangeType) DeadLetterConfig {
+	c.Exchange = name
+	c.ExchangeType = kind
+	return c
+}
+
+// WithQueue returns a new config with the specified DLQ name.
+func (c DeadLetterConfig) WithQueue(name string) DeadLetterConfig {
+	c.Queue = name
+	return c
+}
+
+// WithRoutingKey returns a new config with the specified dead-letter routing key.
+func (c DeadLetterConfig) WithRoutingKey(key string) DeadLetterConfig {
+	c.RoutingKey = key
+	return c
+}
+
+// WithDurable returns a new config with the specified durability for the DLX and DLQ.
+func (c DeadLetterConfig) WithDurable(durable bool) DeadLetterConfig {
+	c.Durable = durable
+	return c
+}
+
+// WithQuorum returns a new config that declares the DLQ as a durable quorum queue.
+func (c DeadLetterConfig) WithQuorum() DeadLetterConfig {
+	c.Quorum = true
+	c.Durable = true // quorum queues must be durable
+	return c
+}
+
+// WithMaxLength returns a new config that caps the DLQ length.
+func (c DeadLetterConfig) WithMaxLength(maxLength int) DeadLetterConfig {
+	c.MaxLength = maxLength
+	return c
+}
+
+// WithMessageTTL returns a new config that expires DLQ entries after ttl.
+func (c DeadLetterConfig) WithMessageTTL(ttl time.Duration) DeadLetterConfig {
+	c.MessageTTL = ttl
+	return c
+}
+
+// buildArgs builds the DLQ declaration arguments. It reuses QueueConfig.buildArgs
+// so the argument keys stay defined in one place.
+func (c DeadLetterConfig) buildArgs() map[string]any {
+	return QueueConfig{
+		Quorum:     c.Quorum,
+		MaxLength:  c.MaxLength,
+		MessageTTL: c.MessageTTL,
+	}.buildArgs()
 }
 
 // QueueConfig holds queue declaration configuration.
