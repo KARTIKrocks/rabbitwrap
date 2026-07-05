@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-05
+
+### Changed
+
+- **`DefaultConsumerConfig().RequeueOnError` now defaults to `false`** (was `true`).
+  Previously a handler that returned an error caused the message to be requeued
+  immediately, forever, with no delay and bypassing any dead-letter queue — a
+  single poison message became a CPU-burning hot loop that head-of-line-blocked
+  the queue. A failed message is now rejected without requeue: dead-lettered if a
+  dead-letter exchange is configured, otherwise discarded. This is a behavioral
+  change — restore the old behavior with `WithRequeueOnError(true)`. (Mirrors the
+  0.3.0 change that made `ConfirmMode` default to `false`.)
+
+### Added
+
+- **Per-message requeue control via sentinel errors.** A handler can return
+  `ErrRequeue` to force the message to be requeued (for transient failures) or
+  `ErrDrop` to force it not to be requeued (for poison messages), overriding the
+  configured `RequeueOnError` default. Both may be wrapped with `%w`.
+
+### Fixed
+
+- **`RetryMiddleware` no longer causes unbounded redelivery under the default
+  config.** After its in-process retries are exhausted the error propagates to
+  the consumer, which now rejects (dead-letters) the message instead of requeuing
+  it. Its doc comment now spells out the interaction with `RequeueOnError` and
+  that retries are in-process (holding the handler goroutine and prefetch slot).
+
 ## [0.5.0] - 2026-07-05
 
 ### Added

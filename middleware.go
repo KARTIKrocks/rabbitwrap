@@ -67,6 +67,14 @@ func LoggingMiddleware(logger Logger) Middleware {
 // RetryMiddleware retries failed message processing up to maxRetries times
 // with the given delay between attempts. A negative maxRetries is treated as
 // zero, so the handler always runs at least once.
+//
+// Retries happen in-process: the handler goroutine (and its prefetch slot) is
+// held for the whole delay, so this suits short retries, not long backoff.
+// After the retries are exhausted the final error propagates to the consumer's
+// normal disposition (see ConsumerConfig.RequeueOnError): with the default it
+// is rejected and dead-lettered. Pairing this with RequeueOnError=true, and not
+// returning ErrDrop from the handler, causes the message to be requeued and
+// retried again — an unbounded loop.
 func RetryMiddleware(maxRetries int, delay time.Duration) Middleware {
 	if maxRetries < 0 {
 		maxRetries = 0

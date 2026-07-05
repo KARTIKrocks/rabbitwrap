@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -35,8 +36,33 @@ func TestDefaultConsumerConfig(t *testing.T) {
 	if c.PrefetchCount != 10 {
 		t.Errorf("expected PrefetchCount 10, got %d", c.PrefetchCount)
 	}
-	if !c.RequeueOnError {
-		t.Error("expected RequeueOnError true")
+	if c.RequeueOnError {
+		t.Error("expected RequeueOnError false (safe default)")
+	}
+}
+
+func TestRequeueDecision(t *testing.T) {
+	tests := []struct {
+		name           string
+		err            error
+		defaultRequeue bool
+		want           bool
+	}{
+		{"nil error, default false", nil, false, false},
+		{"nil error, default true", nil, true, true},
+		{"plain error follows default false", errors.New("boom"), false, false},
+		{"plain error follows default true", errors.New("boom"), true, true},
+		{"ErrRequeue overrides default false", ErrRequeue, false, true},
+		{"ErrRequeue wrapped overrides default false", fmt.Errorf("db down: %w", ErrRequeue), false, true},
+		{"ErrDrop overrides default true", ErrDrop, true, false},
+		{"ErrDrop wrapped overrides default true", fmt.Errorf("poison: %w", ErrDrop), true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requeueDecision(tt.err, tt.defaultRequeue); got != tt.want {
+				t.Errorf("requeueDecision(%v, %v) = %v, want %v", tt.err, tt.defaultRequeue, got, tt.want)
+			}
+		})
 	}
 }
 

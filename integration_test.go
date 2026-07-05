@@ -5,6 +5,7 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -2056,4 +2057,127 @@ func deleteQueue(t *testing.T, conn *Connection, queue string) {
 	}
 	defer ch.Close()
 	_, _ = ch.Raw().QueueDelete(queue, false, false, false)
+}
+
+// --- Requeue disposition ---
+
+// TestIntegration_TerminalErrorNotRequeued verifies that with the default
+// config (RequeueOnError=false) a handler that always errors does NOT hot-loop:
+// the message is rejected once and dead-lettered, and the handler runs a
+// bounded number of times.
+func TestIntegration_TerminalErrorNotRequeued(t *testing.T) {
+	conn := integrationConn(t)
+	mainQ := uniqueQueue(t)
+	dlx := mainQ + ".dlx"
+	dlq := mainQ + ".dlq"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(mainQ))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	// Dead-letter exchange (fanout so the routing key is irrelevant).
+	if err := pub.DeclareExchange(dlx, ExchangeFanout, false, false, nil); err != nil {
+		t.Fatalf("declare dlx: %v", err)
+	}
+	t.Cleanup(func() { deleteExchange(t, conn, dlx) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// DLQ consumer: declares the DLQ and binds it to the DLX.
+	dlqConsumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(dlq).WithDurable(false).WithAutoDelete(true).WithExclusive(true)).
+		WithBinding(dlx, "", nil))
+	if err != nil {
+		t.Fatalf("failed to create dlq consumer: %v", err)
+	}
+	t.Cleanup(func() { dlqConsumer.Close() })
+	dlqCh, err := dlqConsumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start dlq consumer: %v", err)
+	}
+
+	// Main consumer: default config (RequeueOnError=false), queue dead-letters to dlx.
+	mainConsumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(mainQ).WithDurable(false).WithAutoDelete(true).WithExclusive(true).WithDeadLetter(dlx, "")))
+	if err != nil {
+		t.Fatalf("failed to create main consumer: %v", err)
+	}
+	t.Cleanup(func() { mainConsumer.Close() })
+
+	var attempts atomic.Int32
+	go func() {
+		_ = mainConsumer.Consume(ctx, func(_ context.Context, _ *Delivery) error {
+			attempts.Add(1)
+			return errors.New("always fails")
+		})
+	}()
+
+	if err := pub.Publish(ctx, NewTextMessage("poison")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// The rejected message must be dead-lettered to the DLQ.
+	recvDelivery(t, ctx, dlqCh, "poison")
+
+	// And the handler must not have hot-looped: give it a moment, then assert
+	// it ran exactly once (a requeue bug would show many attempts).
+	time.Sleep(300 * time.Millisecond)
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("handler ran %d times, want exactly 1 (no requeue hot-loop)", n)
+	}
+}
+
+// TestIntegration_ErrRequeueRedelivers verifies that a handler returning
+// ErrRequeue causes the message to be requeued even under the default
+// RequeueOnError=false, and that it is redelivered and eventually acked.
+func TestIntegration_ErrRequeueRedelivers(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(false).WithAutoDelete(true).WithExclusive(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var attempts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		_ = consumer.Consume(ctx, func(_ context.Context, _ *Delivery) error {
+			switch attempts.Add(1) {
+			case 1:
+				// Transient failure: force a requeue despite the false default.
+				return fmt.Errorf("transient: %w", ErrRequeue)
+			case 2:
+				close(done)
+			}
+			return nil // success on redelivery → ack
+		})
+	}()
+
+	if err := pub.Publish(ctx, NewTextMessage("retry-me")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("timed out; handler ran %d time(s), expected a redelivery", attempts.Load())
+	}
+	if n := attempts.Load(); n < 2 {
+		t.Errorf("handler ran %d times, want >= 2 (requeued then acked)", n)
+	}
 }

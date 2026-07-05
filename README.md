@@ -331,14 +331,40 @@ handler := combined(myHandler)
 
 ### Error Handling
 
+When a handler returns an error, the message is nacked. By default
+(`RequeueOnError: false`) it is **not** requeued — it is dead-lettered if a
+dead-letter exchange is configured, otherwise discarded. This avoids a poison
+message hot-looping. Opt into unconditional requeue with `WithRequeueOnError(true)`.
+
 ```go
 consConfig := rabbitmq.DefaultConsumerConfig().
     WithQueue("my-queue").
-    WithRequeueOnError(true).
     WithErrorHandler(func(err error) {
         log.Printf("Consumer error: %v", err)
     })
 ```
+
+For per-message control, return a sentinel error from the handler — it overrides
+the `RequeueOnError` default and may be wrapped with `%w`:
+
+```go
+err = consumer.Consume(ctx, func(ctx context.Context, d *rabbitmq.Delivery) error {
+    if err := process(d); err != nil {
+        if isTransient(err) {
+            return fmt.Errorf("temporary: %w", rabbitmq.ErrRequeue) // requeue and retry
+        }
+        return fmt.Errorf("poison: %w", rabbitmq.ErrDrop) // never requeue (dead-letter/discard)
+    }
+    return nil
+})
+```
+
+> **`RetryMiddleware`**: retries happen in-process (the handler goroutine and its
+> prefetch slot are held for the delay), so it suits short retries, not long
+> backoff. After the retries are exhausted the error is nacked per the rules
+> above — so with the default it is dead-lettered. Combining it with
+> `RequeueOnError(true)` (without returning `ErrDrop`) reintroduces an unbounded
+> retry loop.
 
 ## Health Checks
 

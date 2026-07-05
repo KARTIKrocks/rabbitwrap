@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -141,6 +142,30 @@ func TestRetryMiddlewareExhausted(t *testing.T) {
 	err := handler(context.Background(), &Delivery{Message: &Message{}})
 	if err == nil {
 		t.Error("expected error after retries exhausted")
+	}
+}
+
+// TestRetryMiddlewarePreservesDisposition ensures a disposition sentinel
+// returned by the handler survives being propagated through RetryMiddleware,
+// so the consumer's requeue decision still sees it after retries are exhausted.
+func TestRetryMiddlewarePreservesDisposition(t *testing.T) {
+	dropHandler := RetryMiddleware(2, 1*time.Millisecond)(func(_ context.Context, _ *Delivery) error {
+		return fmt.Errorf("poison: %w", ErrDrop)
+	})
+	err := dropHandler(context.Background(), &Delivery{Message: &Message{}})
+	if !errors.Is(err, ErrDrop) {
+		t.Errorf("expected ErrDrop to survive RetryMiddleware, got %v", err)
+	}
+	if requeueDecision(err, true) {
+		t.Error("ErrDrop after retries should force no-requeue even with default true")
+	}
+
+	requeueHandler := RetryMiddleware(2, 1*time.Millisecond)(func(_ context.Context, _ *Delivery) error {
+		return fmt.Errorf("transient: %w", ErrRequeue)
+	})
+	err = requeueHandler(context.Background(), &Delivery{Message: &Message{}})
+	if !requeueDecision(err, false) {
+		t.Error("ErrRequeue after retries should force requeue even with default false")
 	}
 }
 
