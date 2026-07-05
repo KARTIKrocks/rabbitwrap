@@ -187,16 +187,27 @@ func (c ConsumerConfig) WithBinding(exchange, routingKey string, args map[string
 // hand-declaring the DLX, the DLQ, the binding, and the work queue's
 // x-dead-letter-exchange argument.
 //
-// The work queue must be consumer-declared: if no QueueConfig is set, one is
-// synthesized from the queue name (which must therefore be non-empty). Consume
-// the dead-letter queue like any other queue using its name (see
-// DeadLetterQueueName or dl.Queue).
+// The work queue must be named (via WithQueue or WithQueueConfig): the DLX
+// wiring requires a consumer-declared queue, so NewConsumer rejects a
+// dead-letter config with an anonymous work queue (returning ErrInvalidConfig)
+// rather than declaring an orphan server-named queue. Consume the dead-letter
+// queue like any other queue using its name (see DeadLetterQueueName or dl.Queue).
 func (c ConsumerConfig) WithDeadLetterQueue(dl DeadLetterConfig) ConsumerConfig {
 	c.DeadLetter = &dl
 
 	// The work queue must carry x-dead-letter-exchange, which requires it to be
-	// consumer-declared. Synthesize a QueueConfig from the queue name if needed.
-	qc := DefaultQueueConfig(c.Queue)
+	// consumer-declared. Synthesize a QueueConfig from the resolved queue name.
+	// With no name, leave QueueConfig unset so NewConsumer rejects the config
+	// instead of declaring an orphan (durable, empty-name) server-named queue.
+	name := c.Queue
+	if c.QueueConfig != nil {
+		name = c.QueueConfig.Name
+	}
+	if name == "" {
+		return c
+	}
+
+	qc := DefaultQueueConfig(name)
 	if c.QueueConfig != nil {
 		qc = *c.QueueConfig
 	}
@@ -243,6 +254,12 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	queueName := config.Queue
 	if config.QueueConfig != nil {
 		queueName = config.QueueConfig.Name
+	}
+
+	// Dead-lettering requires a named work queue to carry x-dead-letter-exchange;
+	// reject an anonymous one rather than declaring orphan queues on each setup.
+	if config.DeadLetter != nil && queueName == "" {
+		return nil, fmt.Errorf("%w: WithDeadLetterQueue requires a named work queue", ErrInvalidConfig)
 	}
 
 	c := &Consumer{

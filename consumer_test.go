@@ -532,3 +532,13 @@ func TestWithDeadLetterQueue_StoresCopy(t *testing.T) {
 		t.Errorf("stored DeadLetter should be a copy; got Queue=%q", c.DeadLetter.Queue)
 	}
 }
+
+func TestNewConsumer_DeadLetterRequiresNamedQueue(t *testing.T) {
+	// A dead-letter config without a named work queue must be rejected, not
+	// silently turned into an orphan server-named queue.
+	_, err := NewConsumer(&Connection{}, DefaultConsumerConfig().
+		WithDeadLetterQueue(DefaultDeadLetterConfig("orders")))
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for anonymous work queue, got %v", err)
+	}
+}
