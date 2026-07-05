@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-05
+
+### Added
+
+- **Declarative consumer topology that survives reconnects.**
+  `ConsumerConfig.WithQueueConfig(QueueConfig)` and
+  `ConsumerConfig.WithBinding(exchange, routingKey, args)` (new `BindingConfig`
+  type) declare the consumed queue and its bindings as configuration. The
+  consumer re-applies them on **every** channel setup — initially and after
+  each reconnect — so caller-declared queues and bindings are restored
+  automatically after a connection loss. Previously, a named
+  exclusive/auto-delete queue was deleted by the broker when the connection
+  dropped and never re-created or re-bound, silently killing the consumer.
+  `WithBinding` also works with server-named (empty-name) queues, removing the
+  old "re-bind after a reconnect" caveat. When `QueueConfig` is set, its
+  `Name` takes precedence over `ConsumerConfig.Queue`.
+
+### Fixed
+
+- **The consume loop no longer wedges permanently when no reconnect signal is
+  coming.** Consuming can fail while the connection is healthy — queue deleted
+  (server-sent `basic.cancel`), `NOT_FOUND`, precondition failure — and the
+  loop previously blocked forever waiting for a reconnect signal that would
+  never arrive. It now retries channel setup every 5 seconds in addition to
+  reacting to reconnect signals.
+- Re-establishing the consumer channel while the connection is healthy no
+  longer leaks the previous channel; it is closed when replaced. A channel
+  set up concurrently with `Close` is also closed instead of leaking.
+
 ## [0.4.0] - 2026-07-02
 
 ### Fixed

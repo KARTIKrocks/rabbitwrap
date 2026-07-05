@@ -1807,7 +1807,7 @@ func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
 	// The consumer re-declares a fresh server-named queue on reconnect, so its
 	// reported name changes; then delivery must resume on the new queue.
 	newName := waitForReDeclaredQueue(t, consumer, origName)
-	publishUntilDelivered(t, ctx, pub, deliveryCh, newName, "after")
+	publishUntilDelivered(t, ctx, pub, deliveryCh, "", newName, "after")
 }
 
 // recvDelivery waits for one delivery, asserts its body equals want, and acks it.
@@ -1843,17 +1843,21 @@ func waitForReDeclaredQueue(t *testing.T, consumer *Consumer, origName string) s
 	return ""
 }
 
-// publishUntilDelivered re-publishes want to queue until a matching delivery
-// arrives, covering the brief window between queue re-declaration and the
-// consume being re-established. It fails the test if ctx expires first.
-func publishUntilDelivered(t *testing.T, ctx context.Context, pub *Publisher, deliveryCh <-chan *Delivery, queue, want string) {
+// publishUntilDelivered re-publishes want to exchange/routingKey until a
+// matching delivery arrives, covering the window between topology restoration
+// and the consume being re-established. Transient publish errors (e.g. the
+// publisher channel still re-establishing after a reconnect) are retried.
+// It fails the test if ctx expires first.
+func publishUntilDelivered(t *testing.T, ctx context.Context, pub *Publisher, deliveryCh <-chan *Delivery, exchange, routingKey, want string) {
 	t.Helper()
 	for {
 		if ctx.Err() != nil {
 			t.Fatalf("timed out waiting for %q", want)
 		}
-		if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage(want)); err != nil {
-			t.Fatalf("publish %q: %v", want, err)
+		if err := pub.PublishToExchange(ctx, exchange, routingKey, NewTextMessage(want)); err != nil {
+			// The publisher may still be re-establishing its channel; retry.
+			time.Sleep(250 * time.Millisecond)
+			continue
 		}
 		select {
 		case d, ok := <-deliveryCh:
@@ -1869,4 +1873,187 @@ func publishUntilDelivered(t *testing.T, ctx context.Context, pub *Publisher, de
 			// Consume may not be re-established yet; publish again.
 		}
 	}
+}
+
+// --- Declarative Topology ---
+
+func TestIntegration_DeclarativeTopology(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	if err := pub.DeclareExchange(exchange, ExchangeTopic, false, false, nil); err != nil {
+		t.Fatalf("declare exchange: %v", err)
+	}
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil)
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	if consumer.QueueName() != queue {
+		t.Errorf("QueueName() = %q, want %q", consumer.QueueName(), queue)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("via-binding")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "via-binding")
+}
+
+// TestIntegration_TopologyRestoredAfterReconnect verifies that a NAMED
+// exclusive+auto-delete queue declared via WithQueueConfig, plus its binding,
+// is restored after a connection loss. The broker deletes such a queue when
+// the connection dies; without declarative topology the consumer would fail
+// with NOT_FOUND on reconnect and stall forever.
+func TestIntegration_TopologyRestoredAfterReconnect(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	if err := pub.DeclareExchange(exchange, ExchangeTopic, false, false, nil); err != nil {
+		t.Fatalf("declare exchange: %v", err)
+	}
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil)
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	// Sanity: the declared queue + binding deliver before the drop.
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before reconnect: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Force a reconnect by closing the underlying amqp connection out from
+	// under the wrapper; the broker deletes the exclusive queue and its binding.
+	conn.mu.RLock()
+	underlying := conn.conn
+	conn.mu.RUnlock()
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	// The consumer must re-declare the queue, re-bind it, and resume delivery.
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+}
+
+// TestIntegration_ConsumeRecoversAfterQueueDeleted verifies the consume loop
+// does not wedge when the queue is deleted while the CONNECTION stays healthy:
+// the broker sends basic.cancel, the delivery channel closes, and no reconnect
+// signal will ever arrive. The retry timer must re-declare the queue (via
+// QueueConfig) and resume consuming.
+func TestIntegration_ConsumeRecoversAfterQueueDeleted(t *testing.T) {
+	origDelay := consumeRetryDelay
+	consumeRetryDelay = 500 * time.Millisecond
+	t.Cleanup(func() { consumeRetryDelay = origDelay })
+
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue)) // durable, so only an explicit delete removes it
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before delete: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Delete the queue out from under the consumer; the connection stays up.
+	deleteQueue(t, conn, queue)
+
+	// The retry timer must re-declare the queue and resume delivery.
+	publishUntilDelivered(t, ctx, pub, deliveryCh, "", queue, "after")
+}
+
+// deleteExchange removes an exchange on a fresh channel; best-effort cleanup.
+func deleteExchange(t *testing.T, conn *Connection, exchange string) {
+	t.Helper()
+	ch, err := conn.Channel()
+	if err != nil {
+		return
+	}
+	defer ch.Close()
+	_ = ch.Raw().ExchangeDelete(exchange, false, false)
+}
+
+// deleteQueue removes a queue on a fresh channel; best-effort for cleanup,
+// also used to delete a queue out from under a consumer mid-test.
+func deleteQueue(t *testing.T, conn *Connection, queue string) {
+	t.Helper()
+	ch, err := conn.Channel()
+	if err != nil {
+		return
+	}
+	defer ch.Close()
+	_, _ = ch.Raw().QueueDelete(queue, false, false, false)
 }

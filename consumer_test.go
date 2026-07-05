@@ -317,3 +317,62 @@ func TestQueueConfigWithQuorum(t *testing.T) {
 		t.Errorf("expected x-queue-type=quorum, got %v", queueType)
 	}
 }
+
+func TestConsumerConfigWithQueueConfig(t *testing.T) {
+	qc := DefaultQueueConfig("topo-q").WithAutoDelete(true).WithExclusive(true)
+	c := DefaultConsumerConfig().WithQueue("old-name").WithQueueConfig(qc)
+
+	if c.QueueConfig == nil {
+		t.Fatal("expected QueueConfig to be set")
+	}
+	if c.QueueConfig.Name != "topo-q" {
+		t.Errorf("expected QueueConfig name topo-q, got %s", c.QueueConfig.Name)
+	}
+	if c.Queue != "topo-q" {
+		t.Errorf("expected Queue synced to topo-q, got %s", c.Queue)
+	}
+
+	// The config stores a copy: mutating the original must not leak in.
+	qc.Name = "mutated"
+	if c.QueueConfig.Name != "topo-q" {
+		t.Errorf("expected stored copy to stay topo-q, got %s", c.QueueConfig.Name)
+	}
+}
+
+func TestConsumerConfigWithBinding(t *testing.T) {
+	c := DefaultConsumerConfig().
+		WithQueue("q").
+		WithBinding("ex-1", "key.1", nil).
+		WithBinding("ex-2", "key.2", map[string]any{"x-match": "all"})
+
+	if len(c.Bindings) != 2 {
+		t.Fatalf("expected 2 bindings, got %d", len(c.Bindings))
+	}
+	if c.Bindings[0].Exchange != "ex-1" || c.Bindings[0].RoutingKey != "key.1" {
+		t.Errorf("unexpected first binding: %+v", c.Bindings[0])
+	}
+	if c.Bindings[1].Exchange != "ex-2" || c.Bindings[1].RoutingKey != "key.2" {
+		t.Errorf("unexpected second binding: %+v", c.Bindings[1])
+	}
+	if c.Bindings[1].Args["x-match"] != "all" {
+		t.Errorf("unexpected second binding args: %+v", c.Bindings[1].Args)
+	}
+}
+
+func TestConsumerConfigWithBindingCopySemantics(t *testing.T) {
+	base := DefaultConsumerConfig().WithQueue("q").WithBinding("ex", "base", nil)
+
+	// Two configs diverging from the same base must not share bindings.
+	a := base.WithBinding("ex", "a", nil)
+	b := base.WithBinding("ex", "b", nil)
+
+	if len(base.Bindings) != 1 {
+		t.Errorf("base mutated: expected 1 binding, got %d", len(base.Bindings))
+	}
+	if a.Bindings[1].RoutingKey != "a" {
+		t.Errorf("expected a's second binding to be a, got %s", a.Bindings[1].RoutingKey)
+	}
+	if b.Bindings[1].RoutingKey != "b" {
+		t.Errorf("expected b's second binding to be b, got %s", b.Bindings[1].RoutingKey)
+	}
+}
