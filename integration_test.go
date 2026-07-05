@@ -2312,3 +2312,163 @@ func TestIntegration_DeadLetterTopologyRestoredAfterReconnect(t *testing.T) {
 	// binding, and work-queue wiring were all re-declared.
 	publishUntilDelivered(t, ctx, pub, dlqCh, "", work, "after")
 }
+
+// --- Broker-level backoff retry ---
+
+// timedEvent records a delivered message body and the time it was handled.
+type timedEvent struct {
+	body string
+	when time.Time
+}
+
+// collectTimedEvents drains exactly n events, failing on timeout or ctx cancel.
+func collectTimedEvents(t *testing.T, ctx context.Context, events <-chan timedEvent, n int) []timedEvent {
+	t.Helper()
+	got := make([]timedEvent, 0, n)
+	for len(got) < n {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		case <-time.After(15 * time.Second):
+			t.Fatalf("timed out; got %d/%d events: %v", len(got), n, got)
+		case <-ctx.Done():
+			t.Fatalf("context done; got %d/%d events", len(got), n)
+		}
+	}
+	return got
+}
+
+// TestIntegration_BackoffRetryRedeliversViaBroker verifies that BackoffRetryMiddleware
+// retries a failed message at the broker (not in-process): the failed message is
+// re-delivered after the backoff, and — crucially — the handler goroutine and its
+// prefetch slot are NOT held during the wait. A second message published right
+// after the first failure is processed immediately (well before the retry
+// arrives), which the old in-process RetryMiddleware could not do at Concurrency=1.
+func TestIntegration_BackoffRetryRedeliversViaBroker(t *testing.T) {
+	conn := integrationConn(t)
+	work := uniqueQueue(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(work))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	// Single goroutine: if the slot were held during the backoff (as with
+	// in-process retry), the second message would be serialized behind it.
+	cfg := DefaultConsumerConfig().
+		WithConcurrency(1).
+		WithQueueConfig(DefaultQueueConfig(work).WithDurable(true).WithExclusive(true)).
+		WithMiddleware(BackoffRetryMiddleware(pub, work, 3, 1*time.Second))
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	// The holding queue is durable non-exclusive; clean it up explicitly.
+	t.Cleanup(func() { deleteQueue(t, conn, delayQueueName("", work, time.Second)) })
+
+	events := make(chan timedEvent, 8)
+	var aAttempts atomic.Int32
+
+	go func() {
+		_ = consumer.Consume(ctx, func(_ context.Context, d *Delivery) error {
+			events <- timedEvent{string(d.Body), time.Now()}
+			if string(d.Body) == "A" && aAttempts.Add(1) < 2 {
+				return errors.New("A transient failure") // fails once, then succeeds on retry
+			}
+			return nil
+		})
+	}()
+
+	// A fails and is scheduled for a broker-level retry; B is published right after
+	// and must be processed while A waits out its backoff.
+	if err := pub.Publish(ctx, NewTextMessage("A")); err != nil {
+		t.Fatalf("publish A: %v", err)
+	}
+	if err := pub.Publish(ctx, NewTextMessage("B")); err != nil {
+		t.Fatalf("publish B: %v", err)
+	}
+
+	// Expect three deliveries in order: A (fail), B (ok), A (retry ok).
+	got := collectTimedEvents(t, ctx, events, 3)
+	if got[0].body != "A" || got[1].body != "B" || got[2].body != "A" {
+		t.Fatalf("delivery order = [%s %s %s], want [A B A]", got[0].body, got[1].body, got[2].body)
+	}
+	if n := aAttempts.Load(); n != 2 {
+		t.Errorf("A handled %d times, want 2 (initial + one retry)", n)
+	}
+	// Slot-freed proof: B is processed promptly after A's failure, not after A's
+	// ~1s backoff, while A's retry lands only after the delay elapses.
+	if gap := got[1].when.Sub(got[0].when); gap > 700*time.Millisecond {
+		t.Errorf("B processed %s after A's failure; slot appears held during backoff", gap)
+	}
+	if gap := got[2].when.Sub(got[0].when); gap < 900*time.Millisecond {
+		t.Errorf("A retry arrived after %s; expected the ~1s broker backoff", gap)
+	}
+}
+
+// TestIntegration_BackoffRetryExhaustedDeadLetters verifies that once the
+// broker-level retries are exhausted, the final failure follows the normal
+// disposition: with a dead-letter queue configured (WithDeadLetterQueue), the
+// message is dead-lettered rather than retried forever.
+func TestIntegration_BackoffRetryExhaustedDeadLetters(t *testing.T) {
+	conn := integrationConn(t)
+	work := uniqueQueue(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(work))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(work).WithDurable(true).WithExclusive(true)).
+		WithDeadLetterQueue(DefaultDeadLetterConfig(work)).
+		WithMiddleware(BackoffRetryMiddleware(pub, work, 1, 1*time.Second))
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, work+".dlx") })
+	t.Cleanup(func() { deleteQueue(t, conn, work+".dlq") })
+	t.Cleanup(func() { deleteQueue(t, conn, delayQueueName("", work, time.Second)) })
+
+	var attempts atomic.Int32
+	go func() {
+		_ = consumer.Consume(ctx, func(_ context.Context, _ *Delivery) error {
+			attempts.Add(1)
+			return errors.New("always fails")
+		})
+	}()
+
+	// DLQ consumer on the auto-declared dead-letter queue.
+	dlqConsumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(consumer.DeadLetterQueueName()))
+	if err != nil {
+		t.Fatalf("failed to create dlq consumer: %v", err)
+	}
+	t.Cleanup(func() { dlqConsumer.Close() })
+	dlqCh, err := dlqConsumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start dlq consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("poison")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// One broker-level retry, then exhaustion → dead-lettered to the DLQ.
+	recvDelivery(t, ctx, dlqCh, "poison")
+
+	// Initial delivery + exactly one retry = 2 handler runs.
+	if n := attempts.Load(); n != 2 {
+		t.Errorf("handler ran %d times, want 2 (initial + 1 retry)", n)
+	}
+}

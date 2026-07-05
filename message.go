@@ -173,6 +173,18 @@ func (m *Message) WithHeaders(headers map[string]any) *Message {
 	return m
 }
 
+// clone returns a copy of the message with an independent Headers map, so the
+// copy can be mutated (e.g. to stamp a retry-count header) without affecting the
+// original — important when the original is a live *Delivery being redelivered.
+func (m *Message) clone() *Message {
+	c := *m
+	c.Headers = make(map[string]any, len(m.Headers))
+	for k, v := range m.Headers {
+		c.Headers[k] = v
+	}
+	return &c
+}
+
 // toPublishing converts to amqp.Publishing.
 func (m *Message) toPublishing() amqp.Publishing {
 	return amqp.Publishing{
