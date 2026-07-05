@@ -1993,10 +1993,6 @@ func TestIntegration_TopologyRestoredAfterReconnect(t *testing.T) {
 // signal will ever arrive. The retry timer must re-declare the queue (via
 // QueueConfig) and resume consuming.
 func TestIntegration_ConsumeRecoversAfterQueueDeleted(t *testing.T) {
-	origDelay := consumeRetryDelay
-	consumeRetryDelay = 500 * time.Millisecond
-	t.Cleanup(func() { consumeRetryDelay = origDelay })
-
 	conn := integrationConn(t)
 	queue := uniqueQueue(t)
 
@@ -2006,6 +2002,10 @@ func TestIntegration_ConsumeRecoversAfterQueueDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
+	// Shorten the retry so the wedge-recovery path runs quickly. Set before
+	// Start so the write happens-before the consume goroutine reads it; being
+	// per-consumer, there is no shared global to restore (and race) on teardown.
+	consumer.retryDelay = 500 * time.Millisecond
 	t.Cleanup(func() { consumer.Close() })
 	t.Cleanup(func() { deleteQueue(t, conn, queue) })
 

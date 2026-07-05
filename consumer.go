@@ -183,6 +183,7 @@ type Consumer struct {
 	reconnectCh chan struct{}
 	log         Logger
 	handlerWg   sync.WaitGroup
+	retryDelay  time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
 }
 
 // NewConsumer creates a new consumer.
@@ -213,6 +214,7 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 		queue:       queueName,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
+		retryDelay:  defaultConsumeRetryDelay,
 	}
 
 	if err := c.setupChannel(); err != nil {
@@ -328,12 +330,12 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 	return outCh, nil
 }
 
-// consumeRetryDelay is how long the consume loop waits before retrying channel
-// setup when no reconnect signal arrives. Consuming can fail while the
-// connection is healthy (queue deleted, server-sent basic.cancel, precondition
-// failure), in which case no reconnect signal will ever come. A variable so
-// tests can shorten it.
-var consumeRetryDelay = 5 * time.Second
+// defaultConsumeRetryDelay is the default for Consumer.retryDelay: how long the
+// consume loop waits before retrying channel setup when no reconnect signal
+// arrives. Consuming can fail while the connection is healthy (queue deleted,
+// server-sent basic.cancel, precondition failure), in which case no reconnect
+// signal will ever come.
+const defaultConsumeRetryDelay = 5 * time.Second
 
 // waitForReconnect waits for a reconnection signal, a retry timeout, or
 // context cancellation, then re-establishes the channel. Returns true if the
@@ -346,7 +348,7 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		if !ok {
 			return false
 		}
-	case <-time.After(consumeRetryDelay):
+	case <-time.After(c.retryDelay):
 		// No reconnect signal is coming if the connection is healthy but the
 		// queue is gone — retry setup on a timer so the loop never blocks
 		// forever.
