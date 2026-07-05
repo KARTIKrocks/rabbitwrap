@@ -329,11 +329,12 @@ consConfig := rabbitmq.DefaultConsumerConfig().
 
 #### Built-in Middleware
 
-| Middleware                           | Description                           |
-| ------------------------------------ | ------------------------------------- |
-| `LoggingMiddleware(logger)`          | Logs message processing with duration |
-| `RecoveryMiddleware(onPanic)`        | Recovers from panics in handlers      |
-| `RetryMiddleware(maxRetries, delay)` | Retries failed message processing     |
+| Middleware                                             | Description                                                      |
+| ------------------------------------------------------ | ---------------------------------------------------------------- |
+| `LoggingMiddleware(logger)`                            | Logs message processing with duration                            |
+| `RecoveryMiddleware(onPanic)`                          | Recovers from panics in handlers                                 |
+| `RetryMiddleware(maxRetries, delay)`                   | Retries failed processing in-process (short waits)               |
+| `BackoffRetryMiddleware(pub, queue, maxRetries, base)` | Retries at the broker with exponential backoff, freeing the slot |
 
 #### Custom Middleware
 
@@ -392,6 +393,35 @@ err = consumer.Consume(ctx, func(ctx context.Context, d *rabbitmq.Delivery) erro
 > above — so with the default it is dead-lettered. Combining it with
 > `RequeueOnError(true)` (without returning `ErrDrop`) reintroduces an unbounded
 > retry loop.
+
+#### Broker-level backoff retry
+
+For anything but short retries, prefer `BackoffRetryMiddleware`. Instead of
+sleeping in-process, it re-publishes a delayed copy of the failed message back to
+the work queue and acks the original, so the handler goroutine and prefetch slot
+are **freed** for the whole backoff — one poison message can no longer stall the
+consumer. The delay grows exponentially from `base` and the message is
+redelivered by the broker. After `maxRetries` the message is terminal: it is
+rejected **without requeue** — dead-lettered if a dead-letter exchange is
+configured, otherwise discarded — regardless of `RequeueOnError` or a handler
+`ErrRequeue`, so it can never loop forever.
+
+```go
+pub, _ := rabbitmq.NewPublisher(conn, rabbitmq.DefaultPublisherConfig())
+
+consConfig := rabbitmq.DefaultConsumerConfig().
+    WithQueue("orders").
+    WithDeadLetterQueue(rabbitmq.DefaultDeadLetterConfig("orders")). // exhausted retries land here
+    WithMiddleware(
+        // 1s, 2s, 4s, ... (snapped up to the delay ladder), then dead-lettered.
+        rabbitmq.BackoffRetryMiddleware(pub, "orders", 5, 1*time.Second),
+    )
+```
+
+`queue` must be a named work queue (the retry is redelivered to it by name). A
+handler returning `ErrDrop` opts out of retrying. Retrying is at-least-once —
+re-publishing the copy and acking the original are not atomic — so handlers should
+be idempotent.
 
 ## Health Checks
 

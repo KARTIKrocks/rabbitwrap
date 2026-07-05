@@ -215,6 +215,218 @@ func TestLoggingMiddlewareNilLogger(t *testing.T) {
 	}
 }
 
+// fakeDelayedPublisher records the arguments of the last (and count of all)
+// PublishDelayedToExchange calls so BackoffRetryMiddleware can be unit-tested
+// without a broker.
+type fakeDelayedPublisher struct {
+	calls      int
+	exchange   string
+	routingKey string
+	msg        *Message
+	delay      time.Duration
+	err        error // returned by PublishDelayedToExchange
+}
+
+func (f *fakeDelayedPublisher) PublishDelayedToExchange(_ context.Context, exchange, routingKey string, msg *Message, delay time.Duration) error {
+	f.calls++
+	f.exchange = exchange
+	f.routingKey = routingKey
+	f.msg = msg
+	f.delay = delay
+	return f.err
+}
+
+func TestBackoffDelay(t *testing.T) {
+	maxDelay := delayLadder[len(delayLadder)-1]
+
+	tests := []struct {
+		base    time.Duration
+		attempt int
+		want    time.Duration
+	}{
+		{1 * time.Second, 0, 1 * time.Second},
+		{1 * time.Second, 1, 2 * time.Second},
+		{1 * time.Second, 3, 8 * time.Second},
+		{2 * time.Second, 2, 8 * time.Second},
+		{0, 0, 1 * time.Second},                // base <= 0 defaults to 1s
+		{-5 * time.Second, 1, 2 * time.Second}, // negative base defaults to 1s
+		{1 * time.Second, 100, maxDelay},       // huge attempt clamps to the max rung
+	}
+	for _, tt := range tests {
+		if got := backoffDelay(tt.base, tt.attempt); got != tt.want {
+			t.Errorf("backoffDelay(%s, %d) = %s, want %s", tt.base, tt.attempt, got, tt.want)
+		}
+	}
+}
+
+func TestRetryCount(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  int
+	}{
+		{"missing", nil, 0},
+		{"int", 3, 3},
+		{"int32", int32(4), 4},
+		{"int64", int64(5), 5},
+		{"unrecognized", "nope", 0},
+		{"negative clamps to 0", -1, 0}, // must not bypass attempt >= maxRetries
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := map[string]any{}
+			if tt.value != nil {
+				headers[retryCountHeader] = tt.value
+			}
+			d := &Delivery{Message: &Message{Headers: headers}}
+			if got := retryCount(d); got != tt.want {
+				t.Errorf("retryCount = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBackoffRetryMiddlewareSuccess(t *testing.T) {
+	pub := &fakeDelayedPublisher{}
+	handler := BackoffRetryMiddleware(pub, "work", 3, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return nil
+	})
+
+	if err := handler(context.Background(), &Delivery{Message: &Message{}}); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+	if pub.calls != 0 {
+		t.Errorf("expected no publish on success, got %d", pub.calls)
+	}
+}
+
+func TestBackoffRetryMiddlewareSchedulesRetry(t *testing.T) {
+	pub := &fakeDelayedPublisher{}
+	wantErr := errors.New("boom")
+	handler := BackoffRetryMiddleware(pub, "work", 3, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return wantErr
+	})
+
+	// First delivery: no retry-count header -> attempt 0.
+	d := &Delivery{Message: &Message{Headers: map[string]any{}}}
+	err := handler(context.Background(), d)
+	if err != nil {
+		t.Fatalf("expected nil (retry scheduled), got %v", err)
+	}
+	if pub.calls != 1 {
+		t.Fatalf("expected 1 publish, got %d", pub.calls)
+	}
+	if pub.exchange != "" || pub.routingKey != "work" {
+		t.Errorf("expected redelivery to (\"\", work), got (%q, %q)", pub.exchange, pub.routingKey)
+	}
+	if pub.delay != time.Second {
+		t.Errorf("expected delay 1s for attempt 0, got %s", pub.delay)
+	}
+	if got := pub.msg.Headers[retryCountHeader]; got != 1 { // attempt 0 + 1
+		t.Errorf("expected retry-count header 1 on the copy, got %v", got)
+	}
+	// The original delivery must not be mutated by the copy.
+	if _, ok := d.Headers[retryCountHeader]; ok {
+		t.Error("original delivery headers were mutated")
+	}
+}
+
+func TestBackoffRetryMiddlewareExhausted(t *testing.T) {
+	pub := &fakeDelayedPublisher{}
+	handler := BackoffRetryMiddleware(pub, "work", 2, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return errors.New("boom")
+	})
+
+	// Seed the header so this is already the max-th retry.
+	d := &Delivery{Message: &Message{Headers: map[string]any{retryCountHeader: 2}}}
+	err := handler(context.Background(), d)
+	if pub.calls != 0 {
+		t.Errorf("expected no publish once exhausted, got %d", pub.calls)
+	}
+	// Exhausted retries are terminal: forced no-requeue even if the consumer
+	// defaults to requeue, so a failing message can never loop.
+	if !errors.Is(err, ErrDrop) {
+		t.Errorf("expected exhausted error to force ErrDrop, got %v", err)
+	}
+	if requeueDecision(err, true) {
+		t.Error("exhausted retry must not requeue even with RequeueOnError=true")
+	}
+}
+
+// TestBackoffRetryMiddlewareExhaustedNeutralizesRequeue ensures a handler that
+// keeps returning ErrRequeue cannot cause an unbounded requeue loop: once the
+// retries are exhausted the message is forced terminal.
+func TestBackoffRetryMiddlewareExhaustedNeutralizesRequeue(t *testing.T) {
+	pub := &fakeDelayedPublisher{}
+	handler := BackoffRetryMiddleware(pub, "work", 1, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return fmt.Errorf("transient: %w", ErrRequeue)
+	})
+
+	d := &Delivery{Message: &Message{Headers: map[string]any{retryCountHeader: 1}}}
+	err := handler(context.Background(), d)
+	if pub.calls != 0 {
+		t.Errorf("expected no publish once exhausted, got %d", pub.calls)
+	}
+	if requeueDecision(err, false) {
+		t.Error("ErrRequeue at exhaustion must not requeue (would loop forever)")
+	}
+}
+
+func TestBackoffRetryMiddlewareDropIsTerminal(t *testing.T) {
+	pub := &fakeDelayedPublisher{}
+	handler := BackoffRetryMiddleware(pub, "work", 3, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return fmt.Errorf("poison: %w", ErrDrop)
+	})
+
+	err := handler(context.Background(), &Delivery{Message: &Message{Headers: map[string]any{}}})
+	if !errors.Is(err, ErrDrop) {
+		t.Errorf("expected ErrDrop to pass through, got %v", err)
+	}
+	if pub.calls != 0 {
+		t.Errorf("expected no publish for ErrDrop, got %d", pub.calls)
+	}
+}
+
+func TestBackoffRetryMiddlewareScheduleFailureFallsBack(t *testing.T) {
+	wantErr := errors.New("boom")
+	pub := &fakeDelayedPublisher{err: errors.New("broker down")}
+	handler := BackoffRetryMiddleware(pub, "work", 3, time.Second)(func(_ context.Context, _ *Delivery) error {
+		return wantErr
+	})
+
+	err := handler(context.Background(), &Delivery{Message: &Message{Headers: map[string]any{}}})
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected original error when scheduling fails, got %v", err)
+	}
+	if pub.calls != 1 {
+		t.Errorf("expected one publish attempt, got %d", pub.calls)
+	}
+}
+
+func TestBackoffRetryMiddlewareDisabled(t *testing.T) {
+	wantErr := errors.New("boom")
+
+	// nil publisher and empty queue both disable retrying without panicking.
+	for _, tc := range []struct {
+		name  string
+		pub   DelayedPublisher
+		queue string
+	}{
+		{"nil publisher", nil, "work"},
+		{"empty queue", &fakeDelayedPublisher{}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := BackoffRetryMiddleware(tc.pub, tc.queue, 3, time.Second)(func(_ context.Context, _ *Delivery) error {
+				return wantErr
+			})
+			err := handler(context.Background(), &Delivery{Message: &Message{Headers: map[string]any{}}})
+			if !errors.Is(err, wantErr) {
+				t.Errorf("expected error to pass through, got %v", err)
+			}
+		})
+	}
+}
+
 // testLogger is a test helper for Logger interface.
 type testLogger struct {
 	onDebugf func(string, ...any)

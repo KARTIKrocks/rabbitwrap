@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-05
+
+### Added
+
+- **Broker-level backoff retry.** `BackoffRetryMiddleware(pub, queue, maxRetries,
+  base)` retries a failed message at the broker instead of in-process: on failure
+  it re-publishes a delayed copy of the message back to the work queue (via the
+  v0.4.0 delay mechanism) and acks the original, so the handler goroutine and its
+  prefetch slot are freed for the whole backoff — unlike `RetryMiddleware`, which
+  blocks both while it sleeps. The delay grows exponentially (`base`, `2*base`,
+  `4*base`, …, snapped up to a `DelayLadder` rung and capped at the largest). Once
+  `maxRetries` scheduled retries are exhausted, the message is terminal — rejected
+  without requeue (dead-lettered if a dead-letter exchange is configured, else
+  discarded), regardless of `RequeueOnError` or a handler `ErrRequeue`, so a
+  failing message can never loop forever; a handler returning `ErrDrop` opts out of
+  retrying immediately.
+
+  This completes the retry story started in v0.4.0/v0.6.0: prefer this over
+  `RetryMiddleware` for anything but short retries. Retrying is at-least-once
+  (scheduling the copy and acking the original are not atomic), so handlers should
+  be idempotent.
+- `Publisher.PublishDelayedToExchange` — the arbitrary-destination form of
+  `PublishDelayed` (which now delegates to it). `DelayedPublisher` interface
+  (satisfied by `*Publisher`) captures the publish capability the new middleware
+  needs, so it can be supplied with any publisher.
+
 ## [0.7.0] - 2026-07-05
 
 ### Added

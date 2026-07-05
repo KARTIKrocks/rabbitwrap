@@ -335,7 +335,8 @@ func delayQueueName(exchange, routingKey string, delay time.Duration) string {
 }
 
 // PublishDelayed publishes a message that is delivered to the publisher's
-// configured exchange and routing key only after the given delay.
+// configured exchange and routing key only after the given delay. It is a thin
+// wrapper over PublishDelayedToExchange targeting the configured destination.
 //
 // It works without any broker plugin: the message is published into a dedicated
 // holding queue whose queue-level TTL equals the delay and whose dead-letter
@@ -353,11 +354,21 @@ func delayQueueName(exchange, routingKey string, delay time.Duration) string {
 // not for precise scheduling. Dead-lettering does not honor the Mandatory flag,
 // so a message routed to a destination with no queue is dropped on expiry.
 func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time.Duration) error {
+	return p.PublishDelayedToExchange(ctx, p.config.Exchange, p.config.RoutingKey, msg, delay)
+}
+
+// PublishDelayedToExchange publishes a message that is delivered to the given
+// exchange and routing key only after the given delay. It is the arbitrary
+// destination form of PublishDelayed (which targets the publisher's configured
+// exchange/routing key); see PublishDelayed for the full mechanism and timing
+// semantics. Each distinct (exchange, routingKey, delay) uses its own holding
+// queue, so different destinations never share one.
+func (p *Publisher) PublishDelayedToExchange(ctx context.Context, exchange, routingKey string, msg *Message, delay time.Duration) error {
 	if msg == nil {
 		return ErrNilMessage
 	}
 	if delay <= 0 {
-		return p.Publish(ctx, msg)
+		return p.PublishToExchange(ctx, exchange, routingKey, msg)
 	}
 
 	snapped, err := snapDelay(delay)
@@ -365,8 +376,6 @@ func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time
 		return err
 	}
 
-	exchange := p.config.Exchange
-	routingKey := p.config.RoutingKey
 	queueName := delayQueueName(exchange, routingKey, snapped)
 
 	if err := p.declareDelayQueue(queueName, exchange, routingKey, snapped); err != nil {
