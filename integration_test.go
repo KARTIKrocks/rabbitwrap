@@ -2357,10 +2357,13 @@ func TestIntegration_BackoffRetryRedeliversViaBroker(t *testing.T) {
 	}
 	t.Cleanup(func() { pub.Close() })
 
-	// Single goroutine: if the slot were held during the backoff (as with
-	// in-process retry), the second message would be serialized behind it.
+	// Prefetch 1 + a single goroutine: the broker sends the next message only
+	// after the current one is acked, so B can arrive only if the failed A truly
+	// frees its slot (the middleware acks A after scheduling the broker retry). An
+	// in-process retry would hold A unacked and B would never arrive.
 	cfg := DefaultConsumerConfig().
 		WithConcurrency(1).
+		WithPrefetch(1, 0).
 		WithQueueConfig(DefaultQueueConfig(work).WithDurable(true).WithExclusive(true)).
 		WithMiddleware(BackoffRetryMiddleware(pub, work, 3, 1*time.Second))
 	consumer, err := NewConsumer(conn, cfg)
@@ -2393,7 +2396,10 @@ func TestIntegration_BackoffRetryRedeliversViaBroker(t *testing.T) {
 		t.Fatalf("publish B: %v", err)
 	}
 
-	// Expect three deliveries in order: A (fail), B (ok), A (retry ok).
+	// Expect three deliveries in order: A (fail), B (ok), A (retry ok). Under
+	// prefetch 1 this ordering is itself the slot-freed proof: B can only be
+	// delivered once A's slot is released, and it arrives before A's delayed
+	// retry. (No wall-clock upper bound on B — that would be flaky on slow CI.)
 	got := collectTimedEvents(t, ctx, events, 3)
 	if got[0].body != "A" || got[1].body != "B" || got[2].body != "A" {
 		t.Fatalf("delivery order = [%s %s %s], want [A B A]", got[0].body, got[1].body, got[2].body)
@@ -2401,11 +2407,7 @@ func TestIntegration_BackoffRetryRedeliversViaBroker(t *testing.T) {
 	if n := aAttempts.Load(); n != 2 {
 		t.Errorf("A handled %d times, want 2 (initial + one retry)", n)
 	}
-	// Slot-freed proof: B is processed promptly after A's failure, not after A's
-	// ~1s backoff, while A's retry lands only after the delay elapses.
-	if gap := got[1].when.Sub(got[0].when); gap > 700*time.Millisecond {
-		t.Errorf("B processed %s after A's failure; slot appears held during backoff", gap)
-	}
+	// The retry is genuinely broker-delayed, not an instant redelivery.
 	if gap := got[2].when.Sub(got[0].when); gap < 900*time.Millisecond {
 		t.Errorf("A retry arrived after %s; expected the ~1s broker backoff", gap)
 	}

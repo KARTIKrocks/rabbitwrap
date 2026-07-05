@@ -270,6 +270,7 @@ func TestRetryCount(t *testing.T) {
 		{"int32", int32(4), 4},
 		{"int64", int64(5), 5},
 		{"unrecognized", "nope", 0},
+		{"negative clamps to 0", -1, 0}, // must not bypass attempt >= maxRetries
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

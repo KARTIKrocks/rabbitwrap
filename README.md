@@ -401,8 +401,10 @@ sleeping in-process, it re-publishes a delayed copy of the failed message back t
 the work queue and acks the original, so the handler goroutine and prefetch slot
 are **freed** for the whole backoff — one poison message can no longer stall the
 consumer. The delay grows exponentially from `base` and the message is
-redelivered by the broker; after `maxRetries` the error follows the normal
-disposition (dead-lettered if a dead-letter exchange is configured).
+redelivered by the broker. After `maxRetries` the message is terminal: it is
+rejected **without requeue** — dead-lettered if a dead-letter exchange is
+configured, otherwise discarded — regardless of `RequeueOnError` or a handler
+`ErrRequeue`, so it can never loop forever.
 
 ```go
 pub, _ := rabbitmq.NewPublisher(conn, rabbitmq.DefaultPublisherConfig())

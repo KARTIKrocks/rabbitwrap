@@ -167,9 +167,11 @@ func BackoffRetryMiddleware(pub DelayedPublisher, queue string, maxRetries int, 
 			retryMsg := d.clone()
 			retryMsg.Headers[retryCountHeader] = attempt + 1
 			if schedErr := pub.PublishDelayedToExchange(ctx, "", queue, retryMsg, backoffDelay(base, attempt)); schedErr != nil {
-				// Couldn't schedule the retry — fall back to the normal
-				// disposition of the original failure.
-				return err
+				// Couldn't schedule the retry (delayed publish / queue declare
+				// failed): surface that failure while still applying the original
+				// error's disposition (kept in the chain via %w, so an ErrRequeue
+				// still requeues and a plain error still dead-letters/discards).
+				return fmt.Errorf("rabbitmq: scheduling backoff retry failed: %v: %w", schedErr, err)
 			}
 			return nil
 		}
@@ -178,21 +180,25 @@ func BackoffRetryMiddleware(pub DelayedPublisher, queue string, maxRetries int, 
 
 // retryCount reads the broker-level retry count from a delivery's headers. AMQP
 // round-trips integer headers as int32/int64, so several integer types are
-// accepted; a missing or unrecognized header counts as zero.
+// accepted; a missing, unrecognized, or negative header counts as zero (a
+// negative value must not let the attempt >= maxRetries check be bypassed).
 func retryCount(d *Delivery) int {
 	if d.Message == nil {
 		return 0
 	}
+	var n int
 	switch v := d.Headers[retryCountHeader].(type) {
 	case int:
-		return v
+		n = v
 	case int32:
-		return int(v)
+		n = int(v)
 	case int64:
-		return int(v)
-	default:
+		n = int(v)
+	}
+	if n < 0 {
 		return 0
 	}
+	return n
 }
 
 // backoffDelay returns the delay before retry number attempt (0-based):
