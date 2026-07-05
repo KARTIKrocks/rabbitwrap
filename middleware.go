@@ -70,11 +70,16 @@ func LoggingMiddleware(logger Logger) Middleware {
 //
 // Retries happen in-process: the handler goroutine (and its prefetch slot) is
 // held for the whole delay, so this suits short retries, not long backoff.
+// Every non-nil error is retried — including ErrRequeue and ErrDrop; those
+// sentinels only affect the final disposition once the retries are exhausted,
+// not whether a retry happens.
+//
 // After the retries are exhausted the final error propagates to the consumer's
 // normal disposition (see ConsumerConfig.RequeueOnError): with the default it
-// is rejected and dead-lettered. Pairing this with RequeueOnError=true, and not
-// returning ErrDrop from the handler, causes the message to be requeued and
-// retried again — an unbounded loop.
+// is rejected, and dead-lettered if the queue has a dead-letter exchange, else
+// discarded. Pairing this with RequeueOnError=true, and not returning ErrDrop
+// from the handler, causes the message to be requeued and retried again — an
+// unbounded loop.
 func RetryMiddleware(maxRetries int, delay time.Duration) Middleware {
 	if maxRetries < 0 {
 		maxRetries = 0

@@ -2122,11 +2122,15 @@ func TestIntegration_TerminalErrorNotRequeued(t *testing.T) {
 	// The rejected message must be dead-lettered to the DLQ.
 	recvDelivery(t, ctx, dlqCh, "poison")
 
-	// And the handler must not have hot-looped: give it a moment, then assert
-	// it ran exactly once (a requeue bug would show many attempts).
-	time.Sleep(300 * time.Millisecond)
-	if n := attempts.Load(); n != 1 {
-		t.Errorf("handler ran %d times, want exactly 1 (no requeue hot-loop)", n)
+	// And the handler must not have hot-looped: the handler already ran once
+	// (the message reached the DLQ), so sample the count over a short window and
+	// fail the instant it climbs past one. A requeue bug would keep incrementing.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if n := attempts.Load(); n != 1 {
+			t.Fatalf("handler ran %d times, want exactly 1 (no requeue hot-loop)", n)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
