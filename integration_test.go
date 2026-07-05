@@ -2185,3 +2185,130 @@ func TestIntegration_ErrRequeueRedelivers(t *testing.T) {
 		t.Errorf("handler ran %d times, want >= 2 (requeued then acked)", n)
 	}
 }
+
+// --- Dead-letter queue helper ---
+
+// TestIntegration_DeadLetterQueueHelper verifies the one-call WithDeadLetterQueue
+// setup: a failed handler (default RequeueOnError=false) rejects the message, and
+// it is dead-lettered to the auto-declared DLQ, which a second consumer receives.
+func TestIntegration_DeadLetterQueueHelper(t *testing.T) {
+	conn := integrationConn(t)
+	work := uniqueQueue(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Consumer with a one-call DLQ setup. Work queue exclusive to satisfy strict
+	// brokers (transient non-exclusive queues are rejected on 4.x).
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(work).WithDurable(false).WithAutoDelete(true).WithExclusive(true)).
+		WithDeadLetterQueue(DefaultDeadLetterConfig(work))
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	// The DLX/DLQ are durable; clean them up explicitly.
+	t.Cleanup(func() { deleteExchange(t, conn, work+".dlx") })
+	t.Cleanup(func() { deleteQueue(t, conn, work+".dlq") })
+
+	if consumer.DeadLetterQueueName() != work+".dlq" {
+		t.Errorf("DeadLetterQueueName() = %q, want %s.dlq", consumer.DeadLetterQueueName(), work)
+	}
+
+	// Second consumer reading the auto-declared DLQ.
+	dlqConsumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(consumer.DeadLetterQueueName()))
+	if err != nil {
+		t.Fatalf("failed to create dlq consumer: %v", err)
+	}
+	t.Cleanup(func() { dlqConsumer.Close() })
+	dlqCh, err := dlqConsumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start dlq consumer: %v", err)
+	}
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(work))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	go func() {
+		_ = consumer.Consume(ctx, func(_ context.Context, _ *Delivery) error {
+			return errors.New("always fails")
+		})
+	}()
+
+	if err := pub.Publish(ctx, NewTextMessage("poison")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	recvDelivery(t, ctx, dlqCh, "poison")
+}
+
+// TestIntegration_DeadLetterTopologyRestoredAfterReconnect verifies the DLX, DLQ,
+// binding, and work-queue dead-letter wiring are re-declared after a connection
+// loss, so dead-lettering still works once the consumer recovers.
+func TestIntegration_DeadLetterTopologyRestoredAfterReconnect(t *testing.T) {
+	conn := integrationConn(t)
+	work := uniqueQueue(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(work).WithDurable(false).WithAutoDelete(true).WithExclusive(true)).
+		WithDeadLetterQueue(DefaultDeadLetterConfig(work))
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, work+".dlx") })
+	t.Cleanup(func() { deleteQueue(t, conn, work+".dlq") })
+
+	go func() {
+		_ = consumer.Consume(ctx, func(_ context.Context, _ *Delivery) error {
+			return errors.New("always fails")
+		})
+	}()
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(work))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	// DLQ consumer, created before the drop so it recovers via its own reconnect
+	// logic (the durable DLQ survives the connection loss).
+	dlqConsumer, err := NewConsumer(conn, DefaultConsumerConfig().WithQueue(work+".dlq"))
+	if err != nil {
+		t.Fatalf("failed to create dlq consumer: %v", err)
+	}
+	t.Cleanup(func() { dlqConsumer.Close() })
+	dlqCh, err := dlqConsumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start dlq consumer: %v", err)
+	}
+
+	// Sanity: dead-lettering works before the drop. A single message so the DLQ
+	// is drained again before the post-reconnect check (avoids a leftover
+	// "before" being delivered during the "after" phase).
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before: %v", err)
+	}
+	recvDelivery(t, ctx, dlqCh, "before")
+
+	// Force a reconnect: the exclusive work queue is dropped by the broker and
+	// must be re-declared along with its dead-letter wiring.
+	conn.mu.RLock()
+	underlying := conn.conn
+	conn.mu.RUnlock()
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	// After recovery, dead-lettering must still work — proving the DLX, DLQ,
+	// binding, and work-queue wiring were all re-declared.
+	publishUntilDelivered(t, ctx, pub, dlqCh, "", work, "after")
+}

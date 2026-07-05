@@ -247,6 +247,33 @@ automatically and consumption resumes. `WithBinding` also works for
 server-named queues (empty queue name), which get a fresh name on each
 reconnect. The bound exchange must already exist when the consumer is created.
 
+### Dead-Letter Queues
+
+`WithDeadLetterQueue` sets up a work queue's dead-letter topology in one call —
+it declares the dead-letter exchange, the dead-letter queue, the binding between
+them, and wires the work queue to dead-letter into it. Like the rest of the
+topology, it is re-applied on every reconnect. Combined with the default
+`RequeueOnError: false`, a failed handler's message is captured on the DLQ
+instead of being requeued or discarded:
+
+```go
+consConfig := rabbitmq.DefaultConsumerConfig().
+    WithQueueConfig(rabbitmq.DefaultQueueConfig("orders")).
+    WithDeadLetterQueue(rabbitmq.DefaultDeadLetterConfig("orders")) // orders.dlx / orders.dlq
+
+consumer, err := rabbitmq.NewConsumer(conn, consConfig)
+// ... consume "orders"; failures are dead-lettered automatically.
+
+// Read dead-lettered messages like any other queue:
+dlq, _ := rabbitmq.NewConsumer(conn,
+    rabbitmq.DefaultConsumerConfig().WithQueue(consumer.DeadLetterQueueName()))
+```
+
+`DefaultDeadLetterConfig("orders")` derives a durable fanout `orders.dlx` and a
+durable `orders.dlq`; tune names, durability, quorum, max-length, or a TTL with
+the `With*` builders on `DeadLetterConfig`. The work queue must have a name (it
+carries the dead-letter wiring).
+
 ### Concurrent Consumers
 
 Process messages in parallel with multiple worker goroutines:
@@ -302,11 +329,11 @@ consConfig := rabbitmq.DefaultConsumerConfig().
 
 #### Built-in Middleware
 
-| Middleware | Description |
-|---|---|
-| `LoggingMiddleware(logger)` | Logs message processing with duration |
-| `RecoveryMiddleware(onPanic)` | Recovers from panics in handlers |
-| `RetryMiddleware(maxRetries, delay)` | Retries failed message processing |
+| Middleware                           | Description                           |
+| ------------------------------------ | ------------------------------------- |
+| `LoggingMiddleware(logger)`          | Logs message processing with duration |
+| `RecoveryMiddleware(onPanic)`        | Recovers from panics in handlers      |
+| `RetryMiddleware(maxRetries, delay)` | Retries failed message processing     |
 
 #### Custom Middleware
 

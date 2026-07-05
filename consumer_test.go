@@ -434,3 +434,111 @@ func TestConsumerConfigWithBindingCopySemantics(t *testing.T) {
 		t.Errorf("expected b's second binding to be b, got %s", b.Bindings[1].RoutingKey)
 	}
 }
+
+func TestDefaultDeadLetterConfig(t *testing.T) {
+	dl := DefaultDeadLetterConfig("work")
+	if dl.Exchange != "work.dlx" {
+		t.Errorf("Exchange = %q, want work.dlx", dl.Exchange)
+	}
+	if dl.Queue != "work.dlq" {
+		t.Errorf("Queue = %q, want work.dlq", dl.Queue)
+	}
+	if dl.ExchangeType != ExchangeFanout {
+		t.Errorf("ExchangeType = %q, want fanout", dl.ExchangeType)
+	}
+	if !dl.Durable {
+		t.Error("expected Durable true")
+	}
+}
+
+func TestDeadLetterConfigBuilders(t *testing.T) {
+	dl := DefaultDeadLetterConfig("work").
+		WithExchange("custom.dlx", ExchangeDirect).
+		WithQueue("custom.dlq").
+		WithRoutingKey("dead").
+		WithMaxLength(1000).
+		WithMessageTTL(time.Hour)
+
+	if dl.Exchange != "custom.dlx" || dl.ExchangeType != ExchangeDirect {
+		t.Errorf("unexpected exchange: %q/%q", dl.Exchange, dl.ExchangeType)
+	}
+	if dl.Queue != "custom.dlq" || dl.RoutingKey != "dead" {
+		t.Errorf("unexpected queue/key: %q/%q", dl.Queue, dl.RoutingKey)
+	}
+
+	args := dl.buildArgs()
+	if args["x-max-length"] != 1000 {
+		t.Errorf("x-max-length = %v, want 1000", args["x-max-length"])
+	}
+	if args["x-message-ttl"] != time.Hour.Milliseconds() {
+		t.Errorf("x-message-ttl = %v, want %d", args["x-message-ttl"], time.Hour.Milliseconds())
+	}
+
+	if q := DefaultDeadLetterConfig("w").WithQuorum(); !q.Quorum || !q.Durable {
+		t.Error("WithQuorum should set Quorum and force Durable")
+	}
+	if qa := DefaultDeadLetterConfig("w").WithQuorum().buildArgs(); qa["x-queue-type"] != "quorum" {
+		t.Errorf("x-queue-type = %v, want quorum", qa["x-queue-type"])
+	}
+}
+
+func TestWithDeadLetterQueue_SynthesizesQueueConfig(t *testing.T) {
+	// No QueueConfig set: WithDeadLetterQueue synthesizes one from the queue name
+	// and stamps the DLX wiring onto it.
+	c := DefaultConsumerConfig().
+		WithQueue("orders").
+		WithDeadLetterQueue(DefaultDeadLetterConfig("orders"))
+
+	if c.DeadLetter == nil {
+		t.Fatal("expected DeadLetter to be set")
+	}
+	if c.QueueConfig == nil {
+		t.Fatal("expected a synthesized QueueConfig")
+	}
+	if c.QueueConfig.Name != "orders" {
+		t.Errorf("work queue name = %q, want orders", c.QueueConfig.Name)
+	}
+	if c.QueueConfig.DeadLetterExchange != "orders.dlx" {
+		t.Errorf("DeadLetterExchange = %q, want orders.dlx", c.QueueConfig.DeadLetterExchange)
+	}
+	// The work queue's args must carry x-dead-letter-exchange.
+	if c.QueueConfig.buildArgs()["x-dead-letter-exchange"] != "orders.dlx" {
+		t.Error("work queue args missing x-dead-letter-exchange")
+	}
+}
+
+func TestWithDeadLetterQueue_PreservesExistingQueueConfig(t *testing.T) {
+	// An existing QueueConfig keeps its other fields; only DLX wiring is added.
+	c := DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig("orders").WithQuorum().WithMaxLength(500)).
+		WithDeadLetterQueue(DefaultDeadLetterConfig("orders").WithRoutingKey("dead"))
+
+	if !c.QueueConfig.Quorum {
+		t.Error("existing Quorum setting was lost")
+	}
+	if c.QueueConfig.MaxLength != 500 {
+		t.Errorf("existing MaxLength lost: got %d", c.QueueConfig.MaxLength)
+	}
+	if c.QueueConfig.DeadLetterExchange != "orders.dlx" || c.QueueConfig.DeadLetterRoutingKey != "dead" {
+		t.Errorf("DLX wiring not applied: %q/%q", c.QueueConfig.DeadLetterExchange, c.QueueConfig.DeadLetterRoutingKey)
+	}
+}
+
+func TestWithDeadLetterQueue_StoresCopy(t *testing.T) {
+	dl := DefaultDeadLetterConfig("orders")
+	c := DefaultConsumerConfig().WithQueue("orders").WithDeadLetterQueue(dl)
+	dl.Queue = "mutated"
+	if c.DeadLetter.Queue != "orders.dlq" {
+		t.Errorf("stored DeadLetter should be a copy; got Queue=%q", c.DeadLetter.Queue)
+	}
+}
+
+func TestNewConsumer_DeadLetterRequiresNamedQueue(t *testing.T) {
+	// A dead-letter config without a named work queue must be rejected, not
+	// silently turned into an orphan server-named queue.
+	_, err := NewConsumer(&Connection{}, DefaultConsumerConfig().
+		WithDeadLetterQueue(DefaultDeadLetterConfig("orders")))
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for anonymous work queue, got %v", err)
+	}
+}

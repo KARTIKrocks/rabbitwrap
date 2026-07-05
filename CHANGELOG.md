@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-05
+
+### Added
+
+- **One-call dead-letter queue setup.** `ConsumerConfig.WithDeadLetterQueue`
+  (with the new `DeadLetterConfig` type and `DefaultDeadLetterConfig` helper)
+  declares a dead-letter exchange, a dead-letter queue, the binding between them,
+  and wires the work queue's `x-dead-letter-exchange` — previously four separate
+  hand-written declarations. Like the rest of the consumer topology (v0.5.0), it
+  is re-applied on every channel setup, so it survives reconnects and broker
+  restarts. `DefaultDeadLetterConfig("work")` derives `work.dlx` / `work.dlq`
+  (durable fanout); tune with `WithExchange`/`WithQueue`/`WithRoutingKey`/
+  `WithDurable`/`WithQuorum`/`WithMaxLength`/`WithMessageTTL`.
+- `Consumer.DeadLetterQueueName()` returns the configured DLQ name, so a second
+  consumer can read dead-lettered messages without re-deriving it.
+
+  This pairs with the v0.6.0 default (`RequeueOnError=false`): a failed handler
+  now rejects, and with a dead-letter queue configured the message is captured
+  instead of discarded.
+
 ## [0.6.0] - 2026-07-05
 
 ### Changed
