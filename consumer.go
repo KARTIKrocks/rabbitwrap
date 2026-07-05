@@ -54,6 +54,15 @@ type ConsumerConfig struct {
 
 	// Middleware is applied to the message handler in order.
 	Middleware []Middleware
+
+	// QueueConfig, when set, is declared on every channel setup — initially
+	// and after each reconnect — before consuming, so the queue and its
+	// arguments survive connection loss. Its Name takes precedence over Queue.
+	QueueConfig *QueueConfig
+
+	// Bindings are applied to the consumed queue on every channel setup,
+	// initially and after each reconnect.
+	Bindings []BindingConfig
 }
 
 // DefaultConsumerConfig returns a default consumer configuration.
@@ -136,12 +145,37 @@ func (c ConsumerConfig) WithMiddleware(mw ...Middleware) ConsumerConfig {
 	return c
 }
 
+// WithQueueConfig returns a new config that declares the given queue on every
+// channel setup — initially and after each reconnect — so the queue and its
+// arguments are restored after a connection loss. The name in qc takes
+// precedence over any name set with WithQueue; an empty name declares a fresh
+// server-named queue on each setup.
+func (c ConsumerConfig) WithQueueConfig(qc QueueConfig) ConsumerConfig {
+	c.QueueConfig = &qc
+	c.Queue = qc.Name
+	return c
+}
+
+// WithBinding returns a new config that binds the consumed queue to the given
+// exchange on every channel setup — initially and after each reconnect. Call
+// it multiple times to add several bindings. The exchange must exist when the
+// consumer is created, and so must the queue if this consumer does not declare
+// it (a non-empty queue name without WithQueueConfig).
+func (c ConsumerConfig) WithBinding(exchange, routingKey string, args map[string]any) ConsumerConfig {
+	// Copy before appending so config copies never share a backing array.
+	bindings := make([]BindingConfig, len(c.Bindings), len(c.Bindings)+1)
+	copy(bindings, c.Bindings)
+	bindings = append(bindings, BindingConfig{Exchange: exchange, RoutingKey: routingKey, Args: args})
+	c.Bindings = bindings
+	return c
+}
+
 // Consumer consumes messages from RabbitMQ.
 type Consumer struct {
 	conn        *Connection
 	channel     *Channel
 	config      ConsumerConfig
-	serverNamed bool   // config.Queue was empty: declare a fresh server-named queue each setup
+	serverNamed bool   // resolved queue name was empty: declare a fresh server-named queue each setup
 	queue       string // resolved queue name actually consumed from
 	mu          sync.RWMutex
 	closed      bool
@@ -149,26 +183,38 @@ type Consumer struct {
 	reconnectCh chan struct{}
 	log         Logger
 	handlerWg   sync.WaitGroup
+	retryDelay  time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
 }
 
 // NewConsumer creates a new consumer.
 //
-// An empty config.Queue is allowed: the consumer declares a private, server-named
-// queue (exclusive, auto-delete) and consumes from it. Read the assigned name
-// with QueueName. Such a queue is re-declared with a new name on reconnect, so if
-// you bind it to an exchange, re-bind after a reconnect.
+// An empty queue name (config.Queue, or QueueConfig.Name when set) is allowed:
+// the consumer declares a private, server-named queue (exclusive, auto-delete)
+// and consumes from it. Read the assigned name with QueueName.
+//
+// Topology configured with WithQueueConfig and WithBinding is re-applied on
+// every channel setup — initially and after each reconnect — so declared
+// queues and bindings survive connection loss without manual re-declaration.
 func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	if conn == nil {
 		return nil, ErrNilConnection
 	}
 
+	// QueueConfig.Name wins over config.Queue (WithQueueConfig keeps them in
+	// sync, but the fields can also be set directly).
+	queueName := config.Queue
+	if config.QueueConfig != nil {
+		queueName = config.QueueConfig.Name
+	}
+
 	c := &Consumer{
 		conn:        conn,
 		config:      config,
-		serverNamed: config.Queue == "",
-		queue:       config.Queue,
+		serverNamed: queueName == "",
+		queue:       queueName,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
+		retryDelay:  defaultConsumeRetryDelay,
 	}
 
 	if err := c.setupChannel(); err != nil {
@@ -179,7 +225,9 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	return c, nil
 }
 
-// setupChannel creates a new channel and sets QoS.
+// setupChannel creates a new channel, sets QoS, and applies the configured
+// topology. It runs on initial setup and after every reconnect, replacing
+// (and closing) any previous channel.
 func (c *Consumer) setupChannel() error {
 	ch, err := c.conn.Channel()
 	if err != nil {
@@ -191,25 +239,67 @@ func (c *Consumer) setupChannel() error {
 		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
+	queueName, err := c.applyTopology(ch)
+	if err != nil {
+		_ = ch.Close()
+		return err
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		// The consumer was closed while this setup was in flight (e.g. a
+		// retry-timer race with Close); don't install a channel nobody will
+		// ever close.
+		c.mu.Unlock()
+		_ = ch.Close()
+		return ErrShuttingDown
+	}
+	old := c.channel
+	c.channel = ch
+	c.queue = queueName
+	c.mu.Unlock()
+
+	// Close the channel being replaced; when re-setup happens on a healthy
+	// connection (e.g. after the queue was deleted) it would otherwise stay
+	// open and leak.
+	if old != nil {
+		_ = old.Close()
+	}
+
+	return nil
+}
+
+// applyTopology declares the configured queue and applies the configured
+// bindings on the given channel, returning the resolved queue name.
+func (c *Consumer) applyTopology(ch *Channel) (string, error) {
 	queueName := c.config.Queue
-	if c.serverNamed {
+
+	switch {
+	case c.config.QueueConfig != nil:
+		qc := c.config.QueueConfig
+		q, err := ch.ch.QueueDeclare(qc.Name, qc.Durable, qc.AutoDelete, qc.Exclusive, false /*noWait*/, amqp.Table(qc.buildArgs()))
+		if err != nil {
+			return "", fmt.Errorf("declare queue %q: %w", qc.Name, err)
+		}
+		queueName = q.Name
+	case c.serverNamed:
 		// No queue named: declare a private, server-named queue that lives and
 		// dies with this connection (exclusive + auto-delete). The previous one
 		// is gone after a reconnect, so re-declare to get a fresh name.
 		q, err := ch.ch.QueueDeclare("", false /*durable*/, true /*autoDelete*/, true /*exclusive*/, false /*noWait*/, nil)
 		if err != nil {
-			_ = ch.Close()
-			return fmt.Errorf("declare server-named queue: %w", err)
+			return "", fmt.Errorf("declare server-named queue: %w", err)
 		}
 		queueName = q.Name
 	}
 
-	c.mu.Lock()
-	c.channel = ch
-	c.queue = queueName
-	c.mu.Unlock()
+	for _, b := range c.config.Bindings {
+		if err := ch.ch.QueueBind(queueName, b.RoutingKey, b.Exchange, false /*noWait*/, amqp.Table(b.Args)); err != nil {
+			return "", fmt.Errorf("bind queue %q to exchange %q: %w", queueName, b.Exchange, err)
+		}
+	}
 
-	return nil
+	return queueName, nil
 }
 
 // QueueName returns the queue this consumer reads from. When NewConsumer was
@@ -240,9 +330,16 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 	return outCh, nil
 }
 
-// waitForReconnect waits for a reconnection signal or context cancellation.
-// Returns true if reconnection was signaled (caller should continue the loop),
-// or false if the loop should exit.
+// defaultConsumeRetryDelay is the default for Consumer.retryDelay: how long the
+// consume loop waits before retrying channel setup when no reconnect signal
+// arrives. Consuming can fail while the connection is healthy (queue deleted,
+// server-sent basic.cancel, precondition failure), in which case no reconnect
+// signal will ever come.
+const defaultConsumeRetryDelay = 5 * time.Second
+
+// waitForReconnect waits for a reconnection signal, a retry timeout, or
+// context cancellation, then re-establishes the channel. Returns true if the
+// caller should continue the consume loop, or false if it should exit.
 func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -251,11 +348,15 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		if !ok {
 			return false
 		}
-		if err := c.setupChannel(); err != nil {
-			c.log.Errorf("consumer: failed to re-establish channel: %v", err)
-		}
-		return true
+	case <-time.After(c.retryDelay):
+		// No reconnect signal is coming if the connection is healthy but the
+		// queue is gone — retry setup on a timer so the loop never blocks
+		// forever.
 	}
+	if err := c.setupChannel(); err != nil {
+		c.log.Errorf("consumer: failed to re-establish channel: %v", err)
+	}
+	return true
 }
 
 // consumeLoop runs the consume loop, automatically recovering on reconnection.
@@ -582,6 +683,19 @@ type QueueInfo struct {
 	Messages int
 	// Consumers is the number of active consumers on the queue.
 	Consumers int
+}
+
+// BindingConfig describes a queue-to-exchange binding that the consumer
+// applies on every channel setup (see ConsumerConfig.WithBinding).
+type BindingConfig struct {
+	// Exchange is the exchange to bind to.
+	Exchange string
+
+	// RoutingKey is the binding routing key.
+	RoutingKey string
+
+	// Args are additional binding arguments.
+	Args map[string]any
 }
 
 // QueueConfig holds queue declaration configuration.

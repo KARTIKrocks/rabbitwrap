@@ -21,6 +21,7 @@ Requires Go 1.22+.
 ## Features
 
 - **Auto-reconnection** with exponential backoff for connections, publishers, and consumers
+- **Declarative consumer topology** — queues and bindings restored automatically after reconnects
 - **Publisher confirms** for reliable message delivery
 - **Consumer middleware** (logging, recovery, retry — or bring your own)
 - **Concurrent consumers** with configurable worker goroutines
@@ -221,6 +222,30 @@ err = consumer.Consume(ctx, func(ctx context.Context, d *rabbitmq.Delivery) erro
 ```
 
 Consumers automatically resume consuming after the connection recovers.
+
+### Declarative Topology (survives reconnection)
+
+If the consumer's queue or bindings can be lost when the connection drops
+(exclusive or auto-delete queues, bindings on server-named queues), declare
+them as configuration instead of calling `DeclareQueue`/`BindQueue` manually.
+The consumer re-applies this topology on every channel setup — initially and
+after each reconnect:
+
+```go
+consConfig := rabbitmq.DefaultConsumerConfig().
+    WithQueueConfig(rabbitmq.DefaultQueueConfig("ws-fanout").
+        WithDurable(false).
+        WithAutoDelete(true).
+        WithExclusive(true)).
+    WithBinding("events", "user.*", nil)
+
+consumer, err := rabbitmq.NewConsumer(conn, consConfig)
+```
+
+After a broker restart or network blip, the queue is re-declared and re-bound
+automatically and consumption resumes. `WithBinding` also works for
+server-named queues (empty queue name), which get a fresh name on each
+reconnect. The bound exchange must already exist when the consumer is created.
 
 ### Concurrent Consumers
 
