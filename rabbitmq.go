@@ -35,6 +35,15 @@ var (
 	// ErrDelayTooLong is returned by PublishDelayed when the requested delay
 	// exceeds the largest rung of the delay ladder (see DelayLadder).
 	ErrDelayTooLong = errors.New("rabbitmq: delay exceeds maximum supported delay")
+	// ErrRequeue, when returned by a message handler, forces the failed message
+	// to be requeued regardless of ConsumerConfig.RequeueOnError. Use it for
+	// transient failures that are worth retrying. May be wrapped with %w.
+	ErrRequeue = errors.New("rabbitmq: requeue message")
+	// ErrDrop, when returned by a message handler, forces the failed message to
+	// NOT be requeued regardless of ConsumerConfig.RequeueOnError. The message
+	// is dead-lettered if a dead-letter exchange is configured, else discarded.
+	// Use it for poison messages that will never succeed. May be wrapped with %w.
+	ErrDrop = errors.New("rabbitmq: drop message")
 )
 
 // Config holds the RabbitMQ connection configuration.

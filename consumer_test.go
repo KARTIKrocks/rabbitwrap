@@ -1,7 +1,9 @@
 package rabbitmq
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -35,8 +37,64 @@ func TestDefaultConsumerConfig(t *testing.T) {
 	if c.PrefetchCount != 10 {
 		t.Errorf("expected PrefetchCount 10, got %d", c.PrefetchCount)
 	}
-	if !c.RequeueOnError {
-		t.Error("expected RequeueOnError true")
+	if c.RequeueOnError {
+		t.Error("expected RequeueOnError false (safe default)")
+	}
+}
+
+// TestProcessDeliveryNackFailureReported ensures that when Nack fails (here
+// forced by a Delivery with no Acknowledger), the nack error is surfaced to the
+// configured OnError handler rather than swallowed.
+func TestProcessDeliveryNackFailureReported(t *testing.T) {
+	var reported []error
+	c := &Consumer{config: ConsumerConfig{
+		AutoAck:        false,
+		RequeueOnError: false,
+		OnError:        func(err error) { reported = append(reported, err) },
+	}}
+
+	handlerErr := errors.New("handler failed")
+	// Zero-value embedded amqp.Delivery has a nil Acknowledger, so Nack errors.
+	d := &Delivery{Message: &Message{}}
+
+	c.processDelivery(context.Background(), func(_ context.Context, _ *Delivery) error {
+		return handlerErr
+	}, d)
+
+	// OnError is called once for the handler error and once for the nack error.
+	if len(reported) != 2 {
+		t.Fatalf("expected 2 OnError calls (handler + nack), got %d: %v", len(reported), reported)
+	}
+	if !errors.Is(reported[0], handlerErr) {
+		t.Errorf("first OnError = %v, want handler error", reported[0])
+	}
+	if reported[1] == nil || errors.Is(reported[1], handlerErr) {
+		t.Errorf("second OnError = %v, want a non-nil nack error", reported[1])
+	}
+}
+
+func TestRequeueDecision(t *testing.T) {
+	tests := []struct {
+		name           string
+		err            error
+		defaultRequeue bool
+		want           bool
+	}{
+		{"nil error, default false", nil, false, false},
+		{"nil error, default true", nil, true, true},
+		{"plain error follows default false", errors.New("boom"), false, false},
+		{"plain error follows default true", errors.New("boom"), true, true},
+		{"ErrRequeue overrides default false", ErrRequeue, false, true},
+		{"ErrRequeue wrapped overrides default false", fmt.Errorf("db down: %w", ErrRequeue), false, true},
+		{"ErrDrop overrides default true", ErrDrop, true, false},
+		{"ErrDrop wrapped overrides default true", fmt.Errorf("poison: %w", ErrDrop), true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requeueDecision(tt.err, tt.defaultRequeue); got != tt.want {
+				t.Errorf("requeueDecision(%v, %v) = %v, want %v", tt.err, tt.defaultRequeue, got, tt.want)
+			}
+		})
 	}
 }
 

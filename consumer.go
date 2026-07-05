@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -39,7 +40,11 @@ type ConsumerConfig struct {
 	// PrefetchSize is the prefetch size in bytes.
 	PrefetchSize int
 
-	// RequeueOnError requeues messages when handler returns error.
+	// RequeueOnError requeues a message when the handler returns an error
+	// (default: false). When false, a failed message is rejected without
+	// requeue — dead-lettered if a dead-letter exchange is configured, else
+	// discarded — which avoids a poison message hot-looping. A handler can
+	// override this per message by returning ErrRequeue or ErrDrop.
 	RequeueOnError bool
 
 	// Concurrency is the number of goroutines processing messages (default: 1).
@@ -74,7 +79,7 @@ func DefaultConsumerConfig() ConsumerConfig {
 		NoWait:           false,
 		PrefetchCount:    10,
 		PrefetchSize:     0,
-		RequeueOnError:   true,
+		RequeueOnError:   false,
 		Concurrency:      1,
 		GracefulShutdown: true,
 	}
@@ -486,6 +491,20 @@ func (c *Consumer) Consume(ctx context.Context, handler MessageHandler) error {
 	return <-errCh
 }
 
+// requeueDecision decides whether a failed delivery is requeued. An explicit
+// ErrRequeue or ErrDrop returned by the handler overrides the configured
+// default; ErrRequeue wins if both are somehow present.
+func requeueDecision(err error, defaultRequeue bool) bool {
+	switch {
+	case errors.Is(err, ErrRequeue):
+		return true
+	case errors.Is(err, ErrDrop):
+		return false
+	default:
+		return defaultRequeue
+	}
+}
+
 // processDelivery handles a single delivery with ack/nack logic.
 func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, delivery *Delivery) {
 	if err := handler(ctx, delivery); err != nil {
@@ -493,7 +512,7 @@ func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, 
 			c.config.OnError(err)
 		}
 		if !c.config.AutoAck {
-			if nackErr := delivery.Nack(false, c.config.RequeueOnError); nackErr != nil {
+			if nackErr := delivery.Nack(false, requeueDecision(err, c.config.RequeueOnError)); nackErr != nil {
 				if c.config.OnError != nil {
 					c.config.OnError(nackErr)
 				}
