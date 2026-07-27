@@ -2,6 +2,8 @@ package rabbitmq
 
 import (
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -282,6 +284,76 @@ func TestReconnectDelayDefaults(t *testing.T) {
 	delay := c.reconnectDelay(0)
 	if delay != 1*time.Second {
 		t.Errorf("expected default delay 1s, got %s", delay)
+	}
+}
+
+func TestDialErrorIsPermanent(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Auth/config failures — 403 AccessRefused, soft codes. Retrying with
+		// the same parameters can never succeed, so the reconnect loop must give up.
+		{"credentials", amqp.ErrCredentials, true},
+		{"sasl", amqp.ErrSASL, true},
+		{"vhost", amqp.ErrVhost, true},
+		// Wrapped the way connect() surfaces it: %w through ErrConnectionClosed.
+		{"wrapped credentials", fmt.Errorf("%w: %w", ErrConnectionClosed, amqp.ErrCredentials), true},
+		{"not allowed (530)", &amqp.Error{Code: amqp.NotAllowed, Reason: "vhost not permitted"}, true},
+
+		// Transient failures — must keep retrying.
+		{"connection forced (broker restart)", &amqp.Error{Code: 320, Reason: "CONNECTION_FORCED"}, false},
+		{"frame error", &amqp.Error{Code: 501, Reason: "FRAME_ERROR"}, false},
+		{"plain network error", errors.New("dial tcp 127.0.0.1:5672: connect: connection refused"), false},
+		{"wrapped network error", fmt.Errorf("%w: %w", ErrConnectionClosed, errors.New("connection refused")), false},
+		{"nil", nil, false},
+		// A typed-nil *amqp.Error (as amqp091 can deliver on a clean NotifyClose)
+		// still matches errors.As — must not be treated as permanent or panic.
+		{"typed-nil amqp error", func() error { var e *amqp.Error; return e }(), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dialErrorIsPermanent(tt.err); got != tt.want {
+				t.Errorf("dialErrorIsPermanent(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeDisconnectError(t *testing.T) {
+	// A clean close delivers a nil *amqp.Error. It must become a non-nil,
+	// inspectable error (not the typed-nil that panics on Error()).
+	got := normalizeDisconnectError(nil)
+	if !errors.Is(got, ErrConnectionClosed) {
+		t.Errorf("nil *amqp.Error: got %v, want ErrConnectionClosed", got)
+	}
+	// Must be safe to call Error() — this would panic on a typed-nil *amqp.Error.
+	_ = got.Error()
+
+	// A real close reason passes through unchanged.
+	ae := &amqp.Error{Code: amqp.AccessRefused, Reason: "nope"}
+	if got := normalizeDisconnectError(ae); got != error(ae) {
+		t.Errorf("real error: got %v, want passthrough", got)
+	}
+}
+
+func TestSafeOnDisconnect(t *testing.T) {
+	c := &Connection{log: nopLogger{}}
+
+	// A panicking callback must be contained, not propagated — reaching the
+	// next line proves recover() worked.
+	c.safeOnDisconnect(func(error) { panic("boom") }, ErrConnectionClosed)
+
+	// A nil callback is a no-op.
+	c.safeOnDisconnect(nil, ErrConnectionClosed)
+
+	// A well-behaved callback still receives the error.
+	var got error
+	c.safeOnDisconnect(func(e error) { got = e }, ErrMaxReconnects)
+	if !errors.Is(got, ErrMaxReconnects) {
+		t.Errorf("callback got %v, want ErrMaxReconnects", got)
 	}
 }
 
