@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-27
+
+### Changed
+
+- **Reconnect now fails fast on unrecoverable auth errors.** When a reconnection
+  dial is rejected because the credentials, SASL mechanism, or vhost access are
+  wrong (AMQP `403 AccessRefused` / `530 NotAllowed` — i.e. `amqp.ErrCredentials`,
+  `amqp.ErrSASL`, `amqp.ErrVhost`), `handleReconnect` now surfaces the error via
+  the `OnDisconnect` callback and stops, instead of backing off and re-submitting
+  the same rejected parameters forever. Transient failures — network errors, or
+  hard codes such as `320 ConnectionForced` from a broker restart/failover — are
+  unaffected and keep retrying with the existing exponential backoff.
+
+  Classification is by AMQP reply code, not `amqp.Error.Recoverable()`: the
+  dial-time auth sentinels are struct literals whose `Recover` field is false, so
+  `Recoverable()` reports false for exactly these errors. Dial errors are now
+  wrapped with `%w` (previously `%v`) so callers can `errors.As` them back to a
+  `*amqp.Error`; `errors.Is(err, ErrConnectionClosed)` continues to match.
+
+- **`OnDisconnect` now fires on terminal give-up.** Whenever automatic
+  reconnection permanently stops — either the unrecoverable-auth abort above or
+  `MaxReconnectAttempts` being exhausted — the callback is invoked once more with
+  the terminal error (a `*amqp.Error` for auth failures, or the now-used
+  `ErrMaxReconnects` sentinel for exhausted attempts), so applications can react
+  to a permanently dead connection instead of only seeing it in the logs.
+
+### Fixed
+
+- **`OnDisconnect` no longer receives a typed-nil error.** A clean broker close
+  delivers a nil `*amqp.Error`, which as an `error` interface value is non-nil
+  but panics when a handler calls `err.Error()`. It is now normalized to the
+  `ErrConnectionClosed` sentinel before the callback runs, so handlers can always
+  inspect the error safely.
+- **A panicking `OnDisconnect` callback no longer crashes the process.** All
+  callback invocations in the reconnect loop are now wrapped so a panic is
+  recovered and logged instead of propagating out of the internal goroutine.
+
+- **Dependency:** `github.com/rabbitmq/amqp091-go` bumped to v1.13.0 (data-race
+  fixes in `Channel`/`Connection`, concurrent-ack and publish context-cancellation
+  fixes, TLS 1.2 minimum, SASL-credential redaction) — all consumed transparently.
+
 ## [0.8.0] - 2026-07-05
 
 ### Added

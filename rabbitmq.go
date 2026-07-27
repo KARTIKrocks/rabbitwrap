@@ -206,6 +206,41 @@ func (c Config) reconnectDelay(attempt int) time.Duration {
 	return backoff
 }
 
+// dialErrorIsPermanent reports whether a failed reconnection dial was caused
+// by an authentication/authorization problem that retrying with the same
+// parameters can never resolve — bad credentials, an unusable SASL mechanism,
+// or no access to the configured vhost. The reconnect loop always dials with
+// the *same* parameters, so continuing to retry these would just re-submit
+// the same rejected credentials forever, hammering the broker to no effect.
+//
+// The signal is the AMQP reply code, not amqp091's Error.Recoverable(): the
+// dial-time auth sentinels (ErrCredentials, ErrSASL, ErrVhost) are struct
+// literals that leave the Recover field false, so Recoverable() returns false
+// for exactly the errors we need to catch. Both AccessRefused (403) and
+// NotAllowed (530) are permanent authorization failures; every other code —
+// and any non-amqp network error — is treated as transient and keeps retrying.
+func dialErrorIsPermanent(err error) bool {
+	// amqp091 can surface a typed-nil *amqp.Error (e.g. a clean NotifyClose),
+	// which errors.As still matches — guard against dereferencing it.
+	var ae *amqp.Error
+	if errors.As(err, &ae) && ae != nil {
+		return ae.Code == amqp.AccessRefused || ae.Code == amqp.NotAllowed
+	}
+	return false
+}
+
+// normalizeDisconnectError converts the *amqp.Error delivered on NotifyClose
+// into an error that is safe to hand to an OnDisconnect callback. A clean close
+// delivers a nil *amqp.Error; stored in an error interface that value is
+// non-nil yet panics when a handler calls Error() or reads Code. Map it to the
+// ErrConnectionClosed sentinel so handlers can always inspect it.
+func normalizeDisconnectError(amqpErr *amqp.Error) error {
+	if amqpErr == nil {
+		return ErrConnectionClosed
+	}
+	return amqpErr
+}
+
 // Connection manages the RabbitMQ connection with auto-reconnect.
 type Connection struct {
 	config   Config
@@ -269,7 +304,9 @@ func (c *Connection) connect() error {
 
 	conn, err := amqp.DialConfig(c.config.connectionURL(), amqpConfig)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrConnectionClosed, err)
+		// Wrap the dial error with %w (not %v) so callers can errors.As it
+		// back to a *amqp.Error and classify it — see dialErrorIsPermanent.
+		return fmt.Errorf("%w: %w", ErrConnectionClosed, err)
 	}
 
 	c.conn = conn
@@ -281,6 +318,23 @@ func (c *Connection) connect() error {
 	}
 
 	return nil
+}
+
+// safeOnDisconnect invokes an OnDisconnect callback, recovering and logging any
+// panic so a misbehaving callback cannot tear down the reconnect goroutine (and
+// with it the process). The callback runs synchronously to preserve the
+// documented "before reconnection is attempted" ordering; per that contract it
+// must not block.
+func (c *Connection) safeOnDisconnect(fn func(error), err error) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.Errorf("OnDisconnect callback panicked: %v", r)
+		}
+	}()
+	fn(err)
 }
 
 // handleReconnect handles automatic reconnection with exponential backoff.
@@ -298,16 +352,16 @@ func (c *Connection) handleReconnect() {
 			onDisconnect := c.onDisconnect
 			c.mu.RUnlock()
 
-			c.log.Warnf("connection lost: %v", amqpErr)
+			disconnectErr := normalizeDisconnectError(amqpErr)
+			c.log.Warnf("connection lost: %v", disconnectErr)
 
-			if onDisconnect != nil {
-				onDisconnect(amqpErr)
-			}
+			c.safeOnDisconnect(onDisconnect, disconnectErr)
 
 			// Attempt reconnection with exponential backoff
 			for attempt := 0; ; attempt++ {
 				if c.config.MaxReconnectAttempts > 0 && attempt >= c.config.MaxReconnectAttempts {
 					c.log.Errorf("max reconnection attempts (%d) reached, giving up", c.config.MaxReconnectAttempts)
+					c.safeOnDisconnect(onDisconnect, ErrMaxReconnects)
 					return
 				}
 
@@ -321,6 +375,11 @@ func (c *Connection) handleReconnect() {
 				}
 
 				if err := c.connect(); err != nil {
+					if dialErrorIsPermanent(err) {
+						c.log.Errorf("reconnection aborted: unrecoverable error (check credentials, permissions, and vhost): %v", err)
+						c.safeOnDisconnect(onDisconnect, err)
+						return
+					}
 					c.log.Warnf("reconnection attempt %d failed: %v", attempt+1, err)
 					continue
 				}
@@ -374,7 +433,14 @@ func (c *Connection) OnConnect(fn func()) {
 	c.onConnect = fn
 }
 
-// OnDisconnect sets the disconnection callback.
+// OnDisconnect sets the disconnection callback. It is invoked when the
+// connection is lost, before reconnection is attempted. If automatic
+// reconnection then permanently gives up — because the failure is
+// unrecoverable (bad credentials, SASL mechanism, or vhost access) or
+// MaxReconnectAttempts is exhausted — it is invoked once more with the
+// terminal error (a *amqp.Error for auth failures, or ErrMaxReconnects). The
+// callback runs synchronously on an internal goroutine; keep it non-blocking. A
+// panic in the callback is recovered and logged rather than propagated.
 func (c *Connection) OnDisconnect(fn func(error)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

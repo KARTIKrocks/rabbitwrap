@@ -105,6 +105,13 @@ config := rabbitmq.DefaultConfig().
 
 The delay doubles on each attempt: 1s, 2s, 4s, 8s, ... up to the max delay.
 
+Reconnection stops early — regardless of `max attempts` — when the broker
+rejects the dial for an unrecoverable reason: wrong credentials, an unusable
+SASL mechanism, or no access to the vhost (AMQP `403`/`530`). Retrying those
+with the same settings can never succeed, so the loop gives up and reports the
+error through `OnDisconnect` rather than looping forever. Transient failures
+(network drops, broker restarts) keep retrying as normal.
+
 ### Logging
 
 ```go

@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func integrationURL(t *testing.T) string {
@@ -1809,6 +1812,99 @@ func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
 	// reported name changes; then delivery must resume on the new queue.
 	newName := waitForReDeclaredQueue(t, consumer, origName)
 	publishUntilDelivered(t, ctx, pub, deliveryCh, "", newName, "after")
+}
+
+// TestIntegration_ReconnectAbortsOnBadCredentials verifies the fail-fast gate:
+// when a reconnect dial is rejected for bad credentials (403 AccessRefused),
+// the reconnect loop surfaces the error and stops instead of backing off and
+// retrying the same rejected credentials forever.
+func TestIntegration_ReconnectAbortsOnBadCredentials(t *testing.T) {
+	conn := integrationConn(t)
+
+	errCh := make(chan error, 4)
+	conn.OnDisconnect(func(err error) { errCh <- err })
+
+	// Poison the credentials the *next* dial will use. The initial connection
+	// is already established; only the reconnect will be rejected. Keep attempts
+	// unlimited so nothing but the auth gate itself can end the loop.
+	badURL, err := url.Parse(integrationURL(t))
+	if err != nil {
+		t.Fatalf("parse integration url: %v", err)
+	}
+	badURL.User = url.UserPassword("rabbitwrap-bad-user", "rabbitwrap-bad-pass")
+
+	conn.mu.Lock()
+	conn.config.URL = badURL.String()
+	conn.config.ReconnectDelay = 100 * time.Millisecond
+	conn.config.ReconnectDelayMax = 100 * time.Millisecond
+	conn.config.MaxReconnectAttempts = 0
+	underlying := conn.conn
+	conn.mu.Unlock()
+
+	// Force the reconnect: NotifyClose drives handleReconnect, whose dial is now
+	// rejected with 403.
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	// Expect an OnDisconnect carrying a permanent auth error within a few dial
+	// cycles. Without the gate this loop never fires and the test times out —
+	// which is exactly the infinite-retry regression we are guarding against.
+	gotAuthAbort := false
+	timeout := time.After(10 * time.Second)
+	for !gotAuthAbort {
+		select {
+		case err := <-errCh:
+			var ae *amqp.Error
+			if errors.As(err, &ae) && ae != nil && (ae.Code == amqp.AccessRefused || ae.Code == amqp.NotAllowed) {
+				gotAuthAbort = true
+			}
+		case <-timeout:
+			t.Fatal("timed out: reconnect did not abort on bad credentials (loop may be retrying forever)")
+		}
+	}
+
+	if conn.IsHealthy() {
+		t.Error("expected connection to be unhealthy after aborting reconnect")
+	}
+}
+
+// TestIntegration_ReconnectGivesUpAfterMaxAttempts verifies the other terminal
+// path: a transient failure that never clears is retried up to
+// MaxReconnectAttempts and then surfaced via OnDisconnect as ErrMaxReconnects.
+func TestIntegration_ReconnectGivesUpAfterMaxAttempts(t *testing.T) {
+	conn := integrationConn(t)
+
+	errCh := make(chan error, 8)
+	conn.OnDisconnect(func(err error) { errCh <- err })
+
+	// Point the next dial at an address with nothing listening: a transient
+	// network failure (connection refused), not a permanent auth error, so the
+	// loop keeps retrying until the bounded attempt budget is exhausted.
+	conn.mu.Lock()
+	conn.config.URL = "amqp://guest:guest@127.0.0.1:1/"
+	conn.config.ReconnectDelay = 50 * time.Millisecond
+	conn.config.ReconnectDelayMax = 50 * time.Millisecond
+	conn.config.MaxReconnectAttempts = 2
+	underlying := conn.conn
+	conn.mu.Unlock()
+
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	gotMax := false
+	timeout := time.After(15 * time.Second)
+	for !gotMax {
+		select {
+		case err := <-errCh:
+			if errors.Is(err, ErrMaxReconnects) {
+				gotMax = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for ErrMaxReconnects give-up notification")
+		}
+	}
 }
 
 // recvDelivery waits for one delivery, asserts its body equals want, and acks it.
