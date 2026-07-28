@@ -1821,8 +1821,13 @@ func TestIntegration_AnonymousQueueReconnect(t *testing.T) {
 func TestIntegration_ReconnectAbortsOnBadCredentials(t *testing.T) {
 	conn := integrationConn(t)
 
-	errCh := make(chan error, 4)
-	conn.OnDisconnect(func(err error) { errCh <- err })
+	// Separate channels: the abort must arrive on OnReconnectAborted, and the
+	// ordinary connection-lost notification must stay on OnDisconnect. Routing
+	// both to one channel would hide a callback firing on the wrong slot.
+	abortCh := make(chan error, 4)
+	disconnectCh := make(chan error, 4)
+	conn.OnDisconnect(func(err error) { disconnectCh <- err })
+	conn.OnReconnectAborted(func(err error) { abortCh <- err })
 
 	// Poison the credentials the *next* dial will use. The initial connection
 	// is already established; only the reconnect will be rejected. Keep attempts
@@ -1847,21 +1852,34 @@ func TestIntegration_ReconnectAbortsOnBadCredentials(t *testing.T) {
 		t.Fatalf("close underlying connection: %v", err)
 	}
 
-	// Expect an OnDisconnect carrying a permanent auth error within a few dial
-	// cycles. Without the gate this loop never fires and the test times out —
+	// Expect an OnReconnectAborted carrying a permanent auth error within a few
+	// dial cycles. Without the gate this never fires and the test times out —
 	// which is exactly the infinite-retry regression we are guarding against.
-	gotAuthAbort := false
-	timeout := time.After(10 * time.Second)
-	for !gotAuthAbort {
-		select {
-		case err := <-errCh:
-			var ae *amqp.Error
-			if errors.As(err, &ae) && ae != nil && (ae.Code == amqp.AccessRefused || ae.Code == amqp.NotAllowed) {
-				gotAuthAbort = true
-			}
-		case <-timeout:
-			t.Fatal("timed out: reconnect did not abort on bad credentials (loop may be retrying forever)")
+	select {
+	case err := <-abortCh:
+		var ae *amqp.Error
+		if !errors.As(err, &ae) || ae == nil || (ae.Code != amqp.AccessRefused && ae.Code != amqp.NotAllowed) {
+			t.Fatalf("abort did not carry the underlying auth error: %v", err)
 		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out: reconnect did not abort on bad credentials (loop may be retrying forever)")
+	}
+
+	// The connection-lost notification goes to OnDisconnect and stays there: a
+	// caller that treated it as terminal would shut itself down over an ordinary
+	// blip, which is precisely what the separate callback exists to prevent.
+	select {
+	case err := <-disconnectCh:
+		if err == nil {
+			t.Fatal("OnDisconnect received a nil error")
+		}
+	default:
+		t.Fatal("OnDisconnect never fired for the lost connection")
+	}
+	select {
+	case err := <-abortCh:
+		t.Fatalf("OnReconnectAborted fired more than once: %v", err)
+	default:
 	}
 
 	if conn.IsHealthy() {
@@ -1871,12 +1889,15 @@ func TestIntegration_ReconnectAbortsOnBadCredentials(t *testing.T) {
 
 // TestIntegration_ReconnectGivesUpAfterMaxAttempts verifies the other terminal
 // path: a transient failure that never clears is retried up to
-// MaxReconnectAttempts and then surfaced via OnDisconnect as ErrMaxReconnects.
+// MaxReconnectAttempts and then surfaced via OnReconnectAborted as
+// ErrMaxReconnects.
 func TestIntegration_ReconnectGivesUpAfterMaxAttempts(t *testing.T) {
 	conn := integrationConn(t)
 
-	errCh := make(chan error, 8)
-	conn.OnDisconnect(func(err error) { errCh <- err })
+	abortCh := make(chan error, 8)
+	disconnectCh := make(chan error, 8)
+	conn.OnDisconnect(func(err error) { disconnectCh <- err })
+	conn.OnReconnectAborted(func(err error) { abortCh <- err })
 
 	// Point the next dial at an address with nothing listening: a transient
 	// network failure (connection refused), not a permanent auth error, so the
@@ -1893,17 +1914,32 @@ func TestIntegration_ReconnectGivesUpAfterMaxAttempts(t *testing.T) {
 		t.Fatalf("close underlying connection: %v", err)
 	}
 
-	gotMax := false
-	timeout := time.After(15 * time.Second)
-	for !gotMax {
-		select {
-		case err := <-errCh:
-			if errors.Is(err, ErrMaxReconnects) {
-				gotMax = true
-			}
-		case <-timeout:
-			t.Fatal("timed out waiting for ErrMaxReconnects give-up notification")
+	// The abort reports ErrMaxReconnects as the cause, so a handler can tell an
+	// exhausted budget from an auth rejection and respond differently (raise the
+	// limit vs. fix the credentials).
+	select {
+	case err := <-abortCh:
+		if !errors.Is(err, ErrMaxReconnects) {
+			t.Fatalf("give-up cause = %v, want ErrMaxReconnects", err)
 		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for the ErrMaxReconnects give-up notification")
+	}
+
+	// As in the auth-abort case, the connection-lost notification stays on
+	// OnDisconnect and the abort fires exactly once.
+	select {
+	case err := <-disconnectCh:
+		if err == nil {
+			t.Fatal("OnDisconnect received a nil error")
+		}
+	default:
+		t.Fatal("OnDisconnect never fired for the lost connection")
+	}
+	select {
+	case err := <-abortCh:
+		t.Fatalf("OnReconnectAborted fired more than once: %v", err)
+	default:
 	}
 }
 
