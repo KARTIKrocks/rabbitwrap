@@ -29,7 +29,10 @@ func main() {
 		log.Println("connected!")
 	})
 	conn.OnDisconnect(func(err error) {
-		log.Printf("disconnected: %v", err)
+		log.Printf("disconnected, reconnecting: %v", err)
+	})
+	conn.OnReconnectAborted(func(err error) {
+		log.Printf("reconnection permanently aborted: %v", err)
 	})
 
 	// --- Publisher ---

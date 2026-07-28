@@ -339,21 +339,85 @@ func TestNormalizeDisconnectError(t *testing.T) {
 	}
 }
 
-func TestSafeOnDisconnect(t *testing.T) {
+func TestSafeCallback(t *testing.T) {
 	c := &Connection{log: nopLogger{}}
 
 	// A panicking callback must be contained, not propagated — reaching the
 	// next line proves recover() worked.
-	c.safeOnDisconnect(func(error) { panic("boom") }, ErrConnectionClosed)
+	c.safeCallback("OnDisconnect", func(error) { panic("boom") }, ErrConnectionClosed)
 
 	// A nil callback is a no-op.
-	c.safeOnDisconnect(nil, ErrConnectionClosed)
+	c.safeCallback("OnDisconnect", nil, ErrConnectionClosed)
 
 	// A well-behaved callback still receives the error.
 	var got error
-	c.safeOnDisconnect(func(e error) { got = e }, ErrMaxReconnects)
+	c.safeCallback("OnReconnectAborted", func(e error) { got = e }, ErrMaxReconnects)
 	if !errors.Is(got, ErrMaxReconnects) {
 		t.Errorf("callback got %v, want ErrMaxReconnects", got)
+	}
+}
+
+// The abort callback reports the cause unwrapped, so a handler can tell an
+// exhausted attempt budget from a rejected credential without re-implementing
+// the library's reply-code classification. These are the two error forms
+// handleReconnect passes to it.
+func TestReconnectAbortedCauses(t *testing.T) {
+	if !errors.Is(ErrMaxReconnects, ErrMaxReconnects) {
+		t.Error("give-up cause does not match ErrMaxReconnects")
+	}
+
+	// The auth abort passes connect()'s wrapped dial error straight through.
+	authCause := fmt.Errorf("%w: %w", ErrConnectionClosed, amqp.ErrCredentials)
+	var ae *amqp.Error
+	if !errors.As(authCause, &ae) || ae.Code != amqp.AccessRefused {
+		t.Errorf("auth cause does not unwrap to its *amqp.Error: %v", authCause)
+	}
+	// An auth abort must not look like an exhausted budget: the two are
+	// different operator problems (fix the credentials vs. raise the limit).
+	if errors.Is(authCause, ErrMaxReconnects) {
+		t.Error("auth cause matched ErrMaxReconnects")
+	}
+}
+
+// OnDisconnect and OnReconnectAborted are independent slots: registering one
+// must not disturb the other, since handleReconnect reads both under the same
+// lock and dispatches to them at different points in the loop.
+func TestCallbackRegistrationIsIndependent(t *testing.T) {
+	c := &Connection{log: nopLogger{}}
+
+	c.OnDisconnect(func(error) {})
+	if c.onReconnectAborted != nil {
+		t.Error("OnDisconnect set the abort callback")
+	}
+
+	c.OnReconnectAborted(func(error) {})
+	if c.onDisconnect == nil {
+		t.Error("OnReconnectAborted cleared the disconnect callback")
+	}
+}
+
+// The abort callback is read at dispatch time, not captured when the connection
+// dropped: the retry loop can run for a long time before giving up, and a
+// callback registered anywhere in that window must still be invoked.
+func TestAbortCallbackReadsLatestRegistration(t *testing.T) {
+	c := &Connection{log: nopLogger{}}
+
+	if c.abortCallback() != nil {
+		t.Error("unregistered abort callback is not nil")
+	}
+
+	called := false
+	c.OnReconnectAborted(func(error) { called = true })
+	c.safeCallback("OnReconnectAborted", c.abortCallback(), ErrMaxReconnects)
+	if !called {
+		t.Error("callback registered after the drop was not invoked")
+	}
+
+	// Deregistering mid-loop is honored too, rather than resurrecting the
+	// callback captured earlier.
+	c.OnReconnectAborted(nil)
+	if c.abortCallback() != nil {
+		t.Error("abort callback survived deregistration")
 	}
 }
 

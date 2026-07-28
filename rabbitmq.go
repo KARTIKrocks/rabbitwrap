@@ -252,8 +252,9 @@ type Connection struct {
 	log      Logger
 
 	// Callbacks
-	onConnect    func()
-	onDisconnect func(error)
+	onConnect          func()
+	onDisconnect       func(error)
+	onReconnectAborted func(error)
 
 	// Reconnect subscribers — publishers and consumers register here
 	// to be notified when the connection is re-established.
@@ -320,21 +321,34 @@ func (c *Connection) connect() error {
 	return nil
 }
 
-// safeOnDisconnect invokes an OnDisconnect callback, recovering and logging any
-// panic so a misbehaving callback cannot tear down the reconnect goroutine (and
-// with it the process). The callback runs synchronously to preserve the
-// documented "before reconnection is attempted" ordering; per that contract it
-// must not block.
-func (c *Connection) safeOnDisconnect(fn func(error), err error) {
+// safeCallback invokes a user error callback, recovering and logging any panic
+// so a misbehaving callback cannot tear down the reconnect goroutine (and with
+// it the process). name identifies the callback in that log line. Callbacks run
+// synchronously to preserve the documented ordering — OnDisconnect before
+// reconnection is attempted, OnReconnectAborted before the loop exits — so per
+// their contract they must not block.
+func (c *Connection) safeCallback(name string, fn func(error), err error) {
 	if fn == nil {
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			c.log.Errorf("OnDisconnect callback panicked: %v", r)
+			c.log.Errorf("%s callback panicked: %v", name, r)
 		}
 	}()
 	fn(err)
+}
+
+// abortCallback reads the currently registered OnReconnectAborted callback.
+// Unlike OnDisconnect — dispatched the moment the connection drops, so the
+// reconnect loop can capture it up front — an abort fires only once the loop
+// has given up, which with the default unlimited attempts can be a long time
+// after the drop. Reading at dispatch time means a callback registered during
+// that window is still honored.
+func (c *Connection) abortCallback() func(error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onReconnectAborted
 }
 
 // handleReconnect handles automatic reconnection with exponential backoff.
@@ -355,13 +369,13 @@ func (c *Connection) handleReconnect() {
 			disconnectErr := normalizeDisconnectError(amqpErr)
 			c.log.Warnf("connection lost: %v", disconnectErr)
 
-			c.safeOnDisconnect(onDisconnect, disconnectErr)
+			c.safeCallback("OnDisconnect", onDisconnect, disconnectErr)
 
 			// Attempt reconnection with exponential backoff
 			for attempt := 0; ; attempt++ {
 				if c.config.MaxReconnectAttempts > 0 && attempt >= c.config.MaxReconnectAttempts {
 					c.log.Errorf("max reconnection attempts (%d) reached, giving up", c.config.MaxReconnectAttempts)
-					c.safeOnDisconnect(onDisconnect, ErrMaxReconnects)
+					c.safeCallback("OnReconnectAborted", c.abortCallback(), ErrMaxReconnects)
 					return
 				}
 
@@ -377,7 +391,7 @@ func (c *Connection) handleReconnect() {
 				if err := c.connect(); err != nil {
 					if dialErrorIsPermanent(err) {
 						c.log.Errorf("reconnection aborted: unrecoverable error (check credentials, permissions, and vhost): %v", err)
-						c.safeOnDisconnect(onDisconnect, err)
+						c.safeCallback("OnReconnectAborted", c.abortCallback(), err)
 						return
 					}
 					c.log.Warnf("reconnection attempt %d failed: %v", attempt+1, err)
@@ -433,18 +447,48 @@ func (c *Connection) OnConnect(fn func()) {
 	c.onConnect = fn
 }
 
-// OnDisconnect sets the disconnection callback. It is invoked when the
-// connection is lost, before reconnection is attempted. If automatic
-// reconnection then permanently gives up — because the failure is
-// unrecoverable (bad credentials, SASL mechanism, or vhost access) or
-// MaxReconnectAttempts is exhausted — it is invoked once more with the
-// terminal error (a *amqp.Error for auth failures, or ErrMaxReconnects). The
-// callback runs synchronously on an internal goroutine; keep it non-blocking. A
-// panic in the callback is recovered and logged rather than propagated.
+// OnDisconnect sets the disconnection callback. It is invoked exactly once per
+// lost connection, before reconnection is attempted, with the error that closed
+// the connection (a *amqp.Error, or ErrConnectionClosed for a clean close).
+//
+// A disconnect here is not necessarily terminal — the reconnect loop retries
+// with backoff, and a successful reconnection is reported through OnConnect.
+// To learn that reconnection has permanently stopped, use OnReconnectAborted.
+//
+// The callback runs synchronously on an internal goroutine; keep it
+// non-blocking. A panic in the callback is recovered and logged rather than
+// propagated.
 func (c *Connection) OnDisconnect(fn func(error)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onDisconnect = fn
+}
+
+// OnReconnectAborted sets the callback invoked when automatic reconnection
+// permanently gives up and the connection will never recover on its own —
+// either because the failure is unrecoverable (bad credentials, SASL mechanism,
+// or vhost access) or because MaxReconnectAttempts was exhausted. It fires at
+// most once, always after the OnDisconnect for the same connection loss, and
+// nothing further is retried afterwards.
+//
+// The error is the cause: ErrMaxReconnects when the attempt budget ran out,
+// otherwise the rejected dial error, which errors.As can unwrap to its
+// *amqp.Error. Handle this when a permanently dead connection means something
+// different from a brief outage — marking a service unready for good, alerting,
+// or exiting so a supervisor restarts with fresh credentials:
+//
+//	conn.OnReconnectAborted(func(err error) {
+//		health.Fatal(err) // never coming back on its own
+//	})
+//
+// Note that a Connection closed via Close is not an abort and does not fire
+// this callback. The callback runs synchronously on an internal goroutine;
+// keep it non-blocking. A panic in the callback is recovered and logged rather
+// than propagated.
+func (c *Connection) OnReconnectAborted(fn func(error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onReconnectAborted = fn
 }
 
 // Channel creates a new channel.

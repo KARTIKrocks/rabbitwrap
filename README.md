@@ -73,7 +73,14 @@ conn.OnConnect(func() {
 })
 
 conn.OnDisconnect(func(err error) {
-    log.Printf("Disconnected: %v", err)
+    // Transient: the reconnect loop is already backing off and retrying.
+    log.Printf("Disconnected, reconnecting: %v", err)
+})
+
+conn.OnReconnectAborted(func(err error) {
+    // Terminal: reconnection has permanently stopped and the connection will
+    // not come back on its own.
+    log.Printf("RabbitMQ gone for good: %v", err)
 })
 ```
 
@@ -109,8 +116,31 @@ Reconnection stops early — regardless of `max attempts` — when the broker
 rejects the dial for an unrecoverable reason: wrong credentials, an unusable
 SASL mechanism, or no access to the vhost (AMQP `403`/`530`). Retrying those
 with the same settings can never succeed, so the loop gives up and reports the
-error through `OnDisconnect` rather than looping forever. Transient failures
-(network drops, broker restarts) keep retrying as normal.
+error through `OnReconnectAborted` rather than looping forever. Transient
+failures (network drops, broker restarts) keep retrying as normal.
+
+The two callbacks mean different things, and that is the whole point of keeping
+them separate:
+
+| Callback | Fires | Meaning |
+| --- | --- | --- |
+| `OnDisconnect` | once per lost connection, before retrying | briefly down, backing off |
+| `OnReconnectAborted` | at most once, when the loop gives up | gone for good — fix the credentials or restart |
+
+```go
+conn.OnReconnectAborted(func(err error) {
+    // Never coming back on its own.
+    if errors.Is(err, rabbitmq.ErrMaxReconnects) {
+        log.Fatalf("exhausted the reconnect budget: %v", err)
+    }
+    log.Fatalf("broker rejected us permanently: %v", err) // check credentials
+})
+```
+
+The error is the cause, not a wrapper: `ErrMaxReconnects` when the attempt
+budget ran out, otherwise the rejected dial error, which `errors.As` unwraps to
+its `*amqp.Error`. Closing the connection yourself with `Close` is not an abort
+and does not fire the callback.
 
 ### Logging
 
@@ -529,7 +559,7 @@ rabbitmq.ErrInvalidConfig     // Invalid configuration
 rabbitmq.ErrNotConnected      // Not connected
 rabbitmq.ErrTimeout           // Operation timeout
 rabbitmq.ErrNack              // Message was nacked
-rabbitmq.ErrMaxReconnects     // Max reconnection attempts reached
+rabbitmq.ErrMaxReconnects     // Max reconnection attempts reached (see OnReconnectAborted)
 rabbitmq.ErrShuttingDown      // Shutting down
 rabbitmq.ErrNilConnection     // A nil connection was passed to a constructor
 rabbitmq.ErrNilMessage        // A nil message was passed to a publish call

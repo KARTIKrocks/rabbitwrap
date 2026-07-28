@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-07-28
+
+### Added
+
+- **`Connection.OnReconnectAborted` — a dedicated callback for "the connection
+  is never coming back".** It fires at most once, when automatic reconnection
+  permanently gives up, and receives the cause: `ErrMaxReconnects` when the
+  attempt budget ran out, otherwise the rejected dial error, which `errors.As`
+  unwraps to its `*amqp.Error`. Closing the connection yourself with `Close` is
+  not an abort and does not fire it.
+
+  ```go
+  conn.OnDisconnect(func(err error) {
+      health.Degraded(err) // reconnecting, with backoff
+  })
+  conn.OnReconnectAborted(func(err error) {
+      health.Fatal(err) // never coming back on its own
+  })
+  ```
+
+### Changed
+
+- **BREAKING: `OnDisconnect` no longer doubles as the terminal notification.**
+  v0.9.0 invoked it a second time when reconnection gave up, which left callers
+  no way to tell that call apart from the ordinary one preceding every reconnect
+  attempt: both can carry a `*amqp.Error`, and with the default
+  `MaxReconnectAttempts` of 0 the `ErrMaxReconnects` sentinel never appears, so
+  the auth-abort case was distinguishable only by re-implementing the library's
+  reply-code classification against `amqp091-go` directly.
+
+  `OnDisconnect` is now exactly what its name says: fired once per lost
+  connection, before reconnection is attempted, never terminally. Code that
+  needs the terminal signal moves to `OnReconnectAborted`; code that only logs
+  disconnects needs no change.
+
 ## [0.9.0] - 2026-07-27
 
 ### Changed
