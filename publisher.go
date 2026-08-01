@@ -250,12 +250,16 @@ func (p *Publisher) handleReconnect() {
 	var retry <-chan time.Time
 
 	for {
+		// Which arm woke us decides how this attempt is reported: the timer
+		// only fires after a previous setup failed.
+		retrying := false
 		select {
 		case _, ok := <-p.reconnectCh:
 			if !ok {
 				return
 			}
 		case <-retry:
+			retrying = true
 		}
 		retry = nil
 
@@ -266,7 +270,11 @@ func (p *Publisher) handleReconnect() {
 			return
 		}
 
-		p.log.Infof("publisher: re-establishing channel after reconnect")
+		if retrying {
+			p.log.Infof("publisher: retrying channel setup after a failed attempt")
+		} else {
+			p.log.Infof("publisher: re-establishing channel after reconnect")
+		}
 		if err := p.setupChannel(); err != nil {
 			if errors.Is(err, ErrShuttingDown) {
 				return
