@@ -40,6 +40,9 @@ func TestDefaultConsumerConfig(t *testing.T) {
 	if c.RequeueOnError {
 		t.Error("expected RequeueOnError false (safe default)")
 	}
+	if c.TopologyRefreshInterval != defaultTopologyRefreshInterval {
+		t.Errorf("expected TopologyRefreshInterval %v, got %v", defaultTopologyRefreshInterval, c.TopologyRefreshInterval)
+	}
 }
 
 // TestProcessDeliveryNackFailureReported ensures that when Nack fails (here
@@ -625,6 +628,64 @@ func TestNewConsumer_RejectsUnnamedExchange(t *testing.T) {
 		WithExchangeConfig(DefaultExchangeConfig("", ExchangeTopic)))
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("expected ErrInvalidConfig for unnamed exchange, got %v", err)
+	}
+}
+
+func TestConsumerConfigWithTopologyRefresh(t *testing.T) {
+	c := DefaultConsumerConfig().WithTopologyRefresh(2 * time.Minute)
+	if c.TopologyRefreshInterval != 2*time.Minute {
+		t.Errorf("TopologyRefreshInterval = %v, want 2m", c.TopologyRefreshInterval)
+	}
+
+	// Opting out has to be explicit, so the disabling value must be negative:
+	// a zero interval means "use the default".
+	if TopologyRefreshDisabled >= 0 {
+		t.Errorf("TopologyRefreshDisabled = %v, want a negative duration", TopologyRefreshDisabled)
+	}
+	off := DefaultConsumerConfig().WithTopologyRefresh(TopologyRefreshDisabled)
+	if off.TopologyRefreshInterval >= 0 {
+		t.Errorf("TopologyRefreshInterval = %v, want a negative duration", off.TopologyRefreshInterval)
+	}
+}
+
+// TestStartTopologyRefresh covers when the refresh loop is started: only for a
+// consumer that declares topology of its own, and only when not disabled.
+func TestStartTopologyRefresh(t *testing.T) {
+	withBinding := DefaultConsumerConfig().
+		WithQueue("q").
+		WithBinding("ex", "rk", nil)
+
+	tests := []struct {
+		name   string
+		config ConsumerConfig
+		want   bool
+	}{
+		{"declared topology, default interval", withBinding, true},
+		{"declared topology, explicit interval", withBinding.WithTopologyRefresh(time.Hour), true},
+		{"declared topology, disabled", withBinding.WithTopologyRefresh(TopologyRefreshDisabled), false},
+		{"nothing declared", DefaultConsumerConfig().WithQueue("q"), false},
+		{"queue config only", DefaultConsumerConfig().WithQueueConfig(DefaultQueueConfig("q")), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A long interval keeps the loop from ever ticking, so it never
+			// touches the (absent) connection.
+			cfg := tt.config
+			if cfg.TopologyRefreshInterval >= 0 {
+				cfg.TopologyRefreshInterval = time.Hour
+			}
+			c := &Consumer{config: cfg, log: nopLogger{}}
+			c.startTopologyRefresh()
+
+			if got := c.stopRefresh != nil; got != tt.want {
+				t.Errorf("refresh loop started = %v, want %v", got, tt.want)
+			}
+			if c.stopRefresh != nil {
+				close(c.stopRefresh)
+				c.refreshWg.Wait()
+			}
+		})
 	}
 }
 

@@ -21,7 +21,7 @@ Requires Go 1.22+.
 ## Features
 
 - **Auto-reconnection** with exponential backoff for connections, publishers, and consumers
-- **Declarative topology** — exchanges, queues, and bindings restored automatically after reconnects
+- **Declarative topology** — exchanges, queues, and bindings restored automatically after reconnects, and re-applied on a timer so deleted bindings cannot silently strand a consumer
 - **Publisher confirms** for reliable message delivery
 - **Consumer middleware** (logging, recovery, retry — or bring your own)
 - **Concurrent consumers** with configurable worker goroutines
@@ -156,6 +156,10 @@ A consumer re-establishes as part of its consume loop, so this applies while
 a queue or binding created by an imperative call is not restored, while
 `WithExchangeConfig`/`WithQueueConfig`/`WithBinding` are re-applied on every
 channel setup.
+
+Topology destroyed while the channel stays healthy is a different failure —
+there is no exception to react to — and is covered by the
+[topology refresh](#topology-refresh-survives-deletion-not-just-disconnection).
 
 Two consequences worth knowing:
 
@@ -324,8 +328,38 @@ receives anything. Declaring is idempotent, so both sides can declare the same
 exchange — as long as they agree on its type and flags, since a mismatch fails
 with `PRECONDITION_FAILED`.
 
-Publishers take the same option, which is worth using whenever the publisher
-may be the first one up:
+#### Topology refresh (survives deletion, not just disconnection)
+
+Channel setup runs on connection loss and on channel death — and neither
+happens when topology is destroyed underneath a healthy channel. Deleting an
+exchange takes its bindings with it, but leaves the queue, the channel and the
+consume perfectly valid: no error, no channel close, nothing to recover from.
+The consumer stays alive, bound to nothing, and every message published to the
+re-created exchange is dropped with publishes still succeeding.
+
+Nothing in AMQP announces this, so a consumer that declares topology re-applies
+it on a timer — every 30 seconds by default:
+
+```go
+consConfig := rabbitmq.DefaultConsumerConfig().
+    WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic)).
+    WithQueueConfig(rabbitmq.DefaultQueueConfig("ws-fanout")).
+    WithBinding("events", "user.*", nil).
+    WithTopologyRefresh(10 * time.Second)             // or rabbitmq.TopologyRefreshDisabled
+```
+
+Declaring is idempotent, so a refresh is a no-op unless something is actually
+missing. It runs on its own channel — one, held for the consumer's lifetime —
+so a declaration that cannot succeed (an exchange re-created with a different
+type, say) is logged as a warning instead of killing the channel deliveries are
+consumed on. A consumer that declares no topology of its own never starts the
+refresh at all.
+
+Publishers need no equivalent: a publish to a missing exchange kills the
+publisher's channel, and re-establishing it re-declares the exchange.
+
+Publishers take the same `WithExchangeConfig` option, which is worth using
+whenever the publisher may be the first one up:
 
 ```go
 pubConfig := rabbitmq.DefaultPublisherConfig().
