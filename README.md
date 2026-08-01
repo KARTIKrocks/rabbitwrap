@@ -142,6 +142,30 @@ budget ran out, otherwise the rejected dial error, which `errors.As` unwraps to
 its `*amqp.Error`. Closing the connection yourself with `Close` is not an abort
 and does not fire the callback.
 
+### Channel Recovery
+
+Losing the connection is not the only way to lose the ability to publish or
+consume. Any channel-level exception makes the broker close the *channel* while
+the connection stays healthy — publishing to an exchange that does not exist,
+an imperative `BindQueue` against a missing exchange, a declaration that
+conflicts with an existing one. Publishers and consumers watch for this and
+re-establish the channel themselves, so neither is left holding a dead one.
+
+A consumer re-establishes as part of its consume loop, so this applies while
+`Start` or `Consume` is running — which is also why declarative topology matters:
+a queue or binding created by an imperative call is not restored, while
+`WithExchangeConfig`/`WithQueueConfig`/`WithBinding` are re-applied on every
+channel setup.
+
+Two consequences worth knowing:
+
+- The operation that killed the channel is **not** replayed. A publish in
+  flight when the channel dies fails and is yours to retry; recovery restores
+  the channel, not the message.
+- A publish to a missing exchange usually returns `nil`, because the broker's
+  `404` arrives asynchronously. Enable `Mandatory` with `NotifyReturn`, or
+  publisher confirms, if you need to know that a message was actually routed.
+
 ### Logging
 
 ```go

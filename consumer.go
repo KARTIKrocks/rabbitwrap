@@ -255,9 +255,13 @@ type Consumer struct {
 	closed      bool
 	cancelFns   []context.CancelFunc
 	reconnectCh chan struct{}
-	log         Logger
-	handlerWg   sync.WaitGroup
-	retryDelay  time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
+	// chDeadCh carries "the current channel died" from the per-channel close
+	// watcher to the consume loop. Buffered and signalled non-blockingly, so
+	// repeated deaths coalesce into one pending re-establishment.
+	chDeadCh   chan struct{}
+	log        Logger
+	handlerWg  sync.WaitGroup
+	retryDelay time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
 }
 
 // NewConsumer creates a new consumer.
@@ -298,6 +302,7 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 		queue:       queueName,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
+		chDeadCh:    make(chan struct{}, 1),
 		retryDelay:  defaultConsumeRetryDelay,
 	}
 
@@ -350,7 +355,67 @@ func (c *Consumer) setupChannel() error {
 		_ = old.Close()
 	}
 
+	c.watchChannelClose(ch)
+
 	return nil
+}
+
+// watchChannelClose starts the per-channel goroutine that reports a channel
+// death to the consume loop. The broker closes the channel on any channel-level
+// exception — an imperative BindQueue against a missing exchange, a failed
+// declaration — while the connection stays healthy, so no reconnect signal is
+// coming and only the retry timer would notice.
+//
+// The signal is drained by the consume loop, so re-establishment happens while
+// Start/Consume is running; an idle consumer keeps its dead channel until it
+// starts consuming.
+//
+// The goroutine exits when the channel closes, so there is exactly one per
+// established channel.
+func (c *Consumer) watchChannelClose(ch *Channel) {
+	closeCh := make(chan *amqp.Error, 1)
+	ch.ch.NotifyClose(closeCh)
+
+	// A channel that died before this registration is never reported —
+	// NotifyClose only closes the listener once the channel is shutting down —
+	// so catch that case directly instead of waiting for a signal that will
+	// never come.
+	if ch.ch.IsClosed() {
+		c.signalChannelDead(ch, nil)
+		return
+	}
+
+	go func() {
+		amqpErr, ok := <-closeCh
+		if !ok || amqpErr == nil {
+			return // closed gracefully by us
+		}
+		c.signalChannelDead(ch, amqpErr)
+	}()
+}
+
+// signalChannelDead asks the consume loop to re-establish the channel, but only
+// while ch is still the current one: channels replaced by a later setup, and
+// the graceful close done by Close, must not trigger re-establishment. A nil
+// cause means the channel was already gone when its watcher started.
+func (c *Consumer) signalChannelDead(ch *Channel, cause *amqp.Error) {
+	c.mu.RLock()
+	current := c.channel == ch && !c.closed
+	c.mu.RUnlock()
+	if !current {
+		return
+	}
+
+	if cause != nil {
+		c.log.Warnf("consumer: channel closed by broker: %v", cause)
+	} else {
+		c.log.Warnf("consumer: channel was already closed when established")
+	}
+
+	select {
+	case c.chDeadCh <- struct{}{}:
+	default: // a re-establishment is already pending
+	}
 }
 
 // applyTopology declares the configured exchanges and queue and applies the
@@ -473,9 +538,10 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 // signal will ever come.
 const defaultConsumeRetryDelay = 5 * time.Second
 
-// waitForReconnect waits for a reconnection signal, a retry timeout, or
-// context cancellation, then re-establishes the channel. Returns true if the
-// caller should continue the consume loop, or false if it should exit.
+// waitForReconnect waits for a reconnection signal, a channel death, a retry
+// timeout, or context cancellation, then re-establishes the channel. Returns
+// true if the caller should continue the consume loop, or false if it should
+// exit.
 func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -484,10 +550,14 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		if !ok {
 			return false
 		}
+	case <-c.chDeadCh:
+		// The broker closed the channel on a channel-level exception; the
+		// connection is fine, so re-establish immediately rather than waiting
+		// out the retry delay.
 	case <-time.After(c.retryDelay):
-		// No reconnect signal is coming if the connection is healthy but the
-		// queue is gone — retry setup on a timer so the loop never blocks
-		// forever.
+		// No signal is coming if the connection is healthy and the channel is
+		// still open but unusable — the queue was deleted, say — so retry setup
+		// on a timer too, and the loop never blocks forever.
 	}
 	if err := c.setupChannel(); err != nil {
 		c.log.Errorf("consumer: failed to re-establish channel: %v", err)

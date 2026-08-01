@@ -2957,3 +2957,111 @@ func declareExchangeRaw(t *testing.T, conn *Connection, exchange string, kind Ex
 		t.Fatalf("declare %s exchange: %v", kind, err)
 	}
 }
+
+// --- Channel-level recovery ---
+
+// TestIntegration_PublisherRecoversFromChannelException verifies that a
+// publisher recovers when the broker closes its channel on a channel-level
+// exception, without any connection loss. Publishing to a missing exchange
+// answers 404 asynchronously and kills the channel; before the close watcher
+// existed, every later publish failed with 504 for the process lifetime.
+func TestIntegration_PublisherRecoversFromChannelException(t *testing.T) {
+	conn := integrationConn(t)
+	exchange := uniqueQueue(t) + ".ex"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test").
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the exception: %v", err)
+	}
+
+	// Publishing to a missing exchange is a channel-level exception. The 404
+	// arrives asynchronously, so this publish itself usually succeeds.
+	_ = pub.PublishToExchange(ctx, exchange+".does-not-exist", "evt.test", NewTextMessage("boom"))
+
+	// The connection is untouched, so nothing but the channel watcher can
+	// restore publishing.
+	if !conn.IsHealthy() {
+		t.Fatal("connection should still be healthy after a channel-level exception")
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		err := pub.Publish(ctx, NewTextMessage("after"))
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher never recovered its channel: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Error("connection should not have been reconnected to recover the channel")
+	}
+}
+
+// TestIntegration_ConsumerRecoversFromChannelException verifies that a consumer
+// whose channel is killed by a channel-level exception resumes promptly, driven
+// by the close watcher rather than the retry timer: the retry delay is set far
+// beyond the test's own deadline, so only the watcher can restore consumption.
+func TestIntegration_ConsumerRecoversFromChannelException(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
+
+	// Only the channel-death signal can drive recovery within the test window.
+	consumer.mu.Lock()
+	consumer.retryDelay = 10 * time.Minute
+	consumer.mu.Unlock()
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the exception: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Bind to a missing exchange: NOT_FOUND kills the consumer's channel, and
+	// with it the consumption running on that channel.
+	if err := consumer.BindQueue(queue, queue+".no-such-exchange", "k", nil); err == nil {
+		t.Fatal("expected binding to a missing exchange to fail")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection should still be healthy after a channel-level exception")
+	}
+
+	publishUntilDelivered(t, ctx, pub, deliveryCh, "", queue, "after")
+}

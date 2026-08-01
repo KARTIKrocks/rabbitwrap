@@ -121,6 +121,10 @@ type Publisher struct {
 	log         Logger
 	onReturn    func(Return)
 	onReturnMu  sync.RWMutex
+	// chDeadCh carries "the current channel died" from the per-channel close
+	// watcher to handleReconnect. Buffered and signalled non-blockingly, so
+	// repeated deaths coalesce into one pending re-establishment.
+	chDeadCh chan struct{}
 	// setupRetryDelay is how long handleReconnect waits before retrying a
 	// failed channel setup; set before NewPublisher returns (see
 	// defaultPublisherSetupRetryDelay).
@@ -147,6 +151,7 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 		config:          config,
 		reconnectCh:     conn.subscribeReconnect(),
 		log:             conn.log,
+		chDeadCh:        make(chan struct{}, 1),
 		setupRetryDelay: defaultPublisherSetupRetryDelay,
 	}
 
@@ -195,15 +200,78 @@ func (p *Publisher) setupChannel() error {
 		_ = ch.Close()
 		return ErrShuttingDown
 	}
+	old := p.channel
 	p.channel = ch
 	p.mu.Unlock()
+
+	// Close the channel being replaced. After a connection loss it is already
+	// dead, but a channel replaced on a live connection (see watchChannelClose)
+	// would otherwise stay open and leak.
+	if old != nil {
+		_ = old.Close()
+	}
 
 	// Start a single return listener for this channel. It dispatches to the
 	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
 	// its own listener and handlers cannot stack.
 	p.startReturnListener(ch)
+	p.watchChannelClose(ch)
 
 	return nil
+}
+
+// watchChannelClose starts the per-channel goroutine that reports a channel
+// death to handleReconnect. The broker closes the channel on any channel-level
+// exception — publishing to a missing exchange, a failed declaration — which
+// leaves the publisher with a channel it can no longer publish on, and unlike a
+// connection loss that produces no reconnect signal.
+//
+// The goroutine exits when the channel closes, so there is exactly one per
+// established channel.
+func (p *Publisher) watchChannelClose(ch *Channel) {
+	closeCh := make(chan *amqp.Error, 1)
+	ch.ch.NotifyClose(closeCh)
+
+	// A channel that died before this registration is never reported —
+	// NotifyClose only closes the listener once the channel is shutting down —
+	// so catch that case directly instead of waiting for a signal that will
+	// never come.
+	if ch.ch.IsClosed() {
+		p.signalChannelDead(ch, nil)
+		return
+	}
+
+	go func() {
+		amqpErr, ok := <-closeCh
+		if !ok || amqpErr == nil {
+			return // closed gracefully by us
+		}
+		p.signalChannelDead(ch, amqpErr)
+	}()
+}
+
+// signalChannelDead asks handleReconnect to re-establish the channel, but only
+// while ch is still the current one: channels replaced by a later setup, and
+// the graceful close done by Close, must not trigger re-establishment. A nil
+// cause means the channel was already gone when its watcher started.
+func (p *Publisher) signalChannelDead(ch *Channel, cause *amqp.Error) {
+	p.mu.RLock()
+	current := p.channel == ch && !p.closed
+	p.mu.RUnlock()
+	if !current {
+		return
+	}
+
+	if cause != nil {
+		p.log.Warnf("publisher: channel closed by broker: %v", cause)
+	} else {
+		p.log.Warnf("publisher: channel was already closed when established")
+	}
+
+	select {
+	case p.chDeadCh <- struct{}{}:
+	default: // a re-establishment is already pending
+	}
 }
 
 // startReturnListener starts the per-channel goroutine that forwards the
@@ -237,14 +305,16 @@ func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Unlock()
 }
 
-// handleReconnect re-establishes the publisher channel after connection
-// recovery, retrying on a timer when setup fails.
+// handleReconnect owns the publisher's channel lifecycle. It re-establishes the
+// channel after connection recovery, after the broker closes it with a
+// channel-level exception (see watchChannelClose), and on a timer when setup
+// itself fails.
 //
-// Setup can fail even though the connection is healthy — a configured exchange
-// may not be declarable yet — and no further reconnect signal is coming in that
-// case, so a single failed attempt would otherwise leave the publisher without
-// a usable channel until the next connection loss. The publisher only publishes
-// on a channel that completed setup.
+// Both of the latter happen while the connection is perfectly healthy, and
+// neither produces a reconnect signal, so waiting only on reconnects would
+// leave the publisher with an unusable channel until the next connection loss.
+// Serialising all three in one goroutine keeps a single setup in flight at a
+// time; the publisher only publishes on a channel that completed setup.
 func (p *Publisher) handleReconnect() {
 	// A nil channel blocks forever, so retry only fires while one is pending.
 	var retry <-chan time.Time
@@ -252,14 +322,17 @@ func (p *Publisher) handleReconnect() {
 	for {
 		// Which arm woke us decides how this attempt is reported: the timer
 		// only fires after a previous setup failed.
-		retrying := false
+		var reason string
 		select {
 		case _, ok := <-p.reconnectCh:
 			if !ok {
 				return
 			}
+			reason = "re-establishing channel after reconnect"
+		case <-p.chDeadCh:
+			reason = "re-establishing channel after it was closed by the broker"
 		case <-retry:
-			retrying = true
+			reason = "retrying channel setup after a failed attempt"
 		}
 		retry = nil
 
@@ -270,11 +343,7 @@ func (p *Publisher) handleReconnect() {
 			return
 		}
 
-		if retrying {
-			p.log.Infof("publisher: retrying channel setup after a failed attempt")
-		} else {
-			p.log.Infof("publisher: re-establishing channel after reconnect")
-		}
+		p.log.Infof("publisher: %s", reason)
 		if err := p.setupChannel(); err != nil {
 			if errors.Is(err, ErrShuttingDown) {
 				return
