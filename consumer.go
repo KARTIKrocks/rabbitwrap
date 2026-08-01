@@ -355,67 +355,20 @@ func (c *Consumer) setupChannel() error {
 		_ = old.Close()
 	}
 
-	c.watchChannelClose(ch)
+	// The signal is drained by the consume loop, so re-establishment happens
+	// while Start/Consume is running; an idle consumer keeps its dead channel
+	// until it starts consuming.
+	watchChannelClose(ch, c.log, "consumer", c.isCurrentChannel, c.chDeadCh)
 
 	return nil
 }
 
-// watchChannelClose starts the per-channel goroutine that reports a channel
-// death to the consume loop. The broker closes the channel on any channel-level
-// exception — an imperative BindQueue against a missing exchange, a failed
-// declaration — while the connection stays healthy, so no reconnect signal is
-// coming and only the retry timer would notice.
-//
-// The signal is drained by the consume loop, so re-establishment happens while
-// Start/Consume is running; an idle consumer keeps its dead channel until it
-// starts consuming.
-//
-// The goroutine exits when the channel closes, so there is exactly one per
-// established channel.
-func (c *Consumer) watchChannelClose(ch *Channel) {
-	closeCh := make(chan *amqp.Error, 1)
-	ch.ch.NotifyClose(closeCh)
-
-	// A channel that died before this registration is never reported —
-	// NotifyClose only closes the listener once the channel is shutting down —
-	// so catch that case directly instead of waiting for a signal that will
-	// never come.
-	if ch.ch.IsClosed() {
-		c.signalChannelDead(ch, nil)
-		return
-	}
-
-	go func() {
-		amqpErr, ok := <-closeCh
-		if !ok || amqpErr == nil {
-			return // closed gracefully by us
-		}
-		c.signalChannelDead(ch, amqpErr)
-	}()
-}
-
-// signalChannelDead asks the consume loop to re-establish the channel, but only
-// while ch is still the current one: channels replaced by a later setup, and
-// the graceful close done by Close, must not trigger re-establishment. A nil
-// cause means the channel was already gone when its watcher started.
-func (c *Consumer) signalChannelDead(ch *Channel, cause *amqp.Error) {
+// isCurrentChannel reports whether ch is the channel the consumer is still
+// using. It is the currency test for the channel-close watcher.
+func (c *Consumer) isCurrentChannel(ch *Channel) bool {
 	c.mu.RLock()
-	current := c.channel == ch && !c.closed
-	c.mu.RUnlock()
-	if !current {
-		return
-	}
-
-	if cause != nil {
-		c.log.Warnf("consumer: channel closed by broker: %v", cause)
-	} else {
-		c.log.Warnf("consumer: channel was already closed when established")
-	}
-
-	select {
-	case c.chDeadCh <- struct{}{}:
-	default: // a re-establishment is already pending
-	}
+	defer c.mu.RUnlock()
+	return c.channel == ch && !c.closed
 }
 
 // applyTopology declares the configured exchanges and queue and applies the
@@ -554,6 +507,11 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		// The broker closed the channel on a channel-level exception; the
 		// connection is fine, so re-establish immediately rather than waiting
 		// out the retry delay.
+		//
+		// A connection loss signals both this and a reconnect, so one of the two
+		// can be left over and read once the channel has already been replaced.
+		// That costs nothing here: this function only runs when the loop needs a
+		// channel to consume on, and every arm ends in the same setup.
 	case <-time.After(c.retryDelay):
 		// No signal is coming if the connection is healthy and the channel is
 		// still open but unusable — the queue was deleted, say — so retry setup
@@ -640,7 +598,8 @@ func (c *Consumer) forwardDeliveries(ctx context.Context, outCh chan<- *Delivery
 
 // Consume starts consuming and calls handler for each message.
 // The handler is automatically wrapped with any configured middleware.
-// Consumption automatically resumes after connection recovery.
+// Consumption automatically resumes after connection recovery, and after the
+// broker closes the channel on a channel-level exception.
 // If Concurrency > 1, multiple goroutines process messages in parallel.
 func (c *Consumer) Consume(ctx context.Context, handler MessageHandler) error {
 	// Apply middleware
@@ -1243,9 +1202,11 @@ func declareExchange(ch *Channel, ec ExchangeConfig) error {
 // DeclareExchange declares an exchange on the consumer's channel.
 //
 // A failed declaration (for example a type mismatch with an existing exchange)
-// closes the underlying channel, taking any in-flight consumption with it, so
-// prefer WithExchangeConfig — it declares the exchange on every channel setup
-// and so also survives reconnects.
+// closes the underlying channel, taking any in-flight consumption with it. A
+// running consume loop re-establishes the channel, but the exchange declared
+// here is not re-applied — so prefer WithExchangeConfig, which declares the
+// exchange on every channel setup and so survives both a channel-level
+// exception and a reconnect.
 func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
 	c.mu.RLock()
 	ch := c.channel

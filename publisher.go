@@ -215,63 +215,24 @@ func (p *Publisher) setupChannel() error {
 	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
 	// its own listener and handlers cannot stack.
 	p.startReturnListener(ch)
-	p.watchChannelClose(ch)
+	watchChannelClose(ch, p.log, "publisher", p.isCurrentChannel, p.chDeadCh)
 
 	return nil
 }
 
-// watchChannelClose starts the per-channel goroutine that reports a channel
-// death to handleReconnect. The broker closes the channel on any channel-level
-// exception — publishing to a missing exchange, a failed declaration — which
-// leaves the publisher with a channel it can no longer publish on, and unlike a
-// connection loss that produces no reconnect signal.
-//
-// The goroutine exits when the channel closes, so there is exactly one per
-// established channel.
-func (p *Publisher) watchChannelClose(ch *Channel) {
-	closeCh := make(chan *amqp.Error, 1)
-	ch.ch.NotifyClose(closeCh)
-
-	// A channel that died before this registration is never reported —
-	// NotifyClose only closes the listener once the channel is shutting down —
-	// so catch that case directly instead of waiting for a signal that will
-	// never come.
-	if ch.ch.IsClosed() {
-		p.signalChannelDead(ch, nil)
-		return
-	}
-
-	go func() {
-		amqpErr, ok := <-closeCh
-		if !ok || amqpErr == nil {
-			return // closed gracefully by us
-		}
-		p.signalChannelDead(ch, amqpErr)
-	}()
+// isCurrentChannel reports whether ch is the channel the publisher is still
+// using. It is the currency test for the channel-close watcher.
+func (p *Publisher) isCurrentChannel(ch *Channel) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.channel == ch && !p.closed
 }
 
-// signalChannelDead asks handleReconnect to re-establish the channel, but only
-// while ch is still the current one: channels replaced by a later setup, and
-// the graceful close done by Close, must not trigger re-establishment. A nil
-// cause means the channel was already gone when its watcher started.
-func (p *Publisher) signalChannelDead(ch *Channel, cause *amqp.Error) {
+// channelDead reports whether the publisher has no usable channel.
+func (p *Publisher) channelDead() bool {
 	p.mu.RLock()
-	current := p.channel == ch && !p.closed
-	p.mu.RUnlock()
-	if !current {
-		return
-	}
-
-	if cause != nil {
-		p.log.Warnf("publisher: channel closed by broker: %v", cause)
-	} else {
-		p.log.Warnf("publisher: channel was already closed when established")
-	}
-
-	select {
-	case p.chDeadCh <- struct{}{}:
-	default: // a re-establishment is already pending
-	}
+	defer p.mu.RUnlock()
+	return p.channel == nil || p.channel.ch.IsClosed()
 }
 
 // startReturnListener starts the per-channel goroutine that forwards the
@@ -330,6 +291,15 @@ func (p *Publisher) handleReconnect() {
 			}
 			reason = "re-establishing channel after reconnect"
 		case <-p.chDeadCh:
+			// The signal can be stale: a connection loss kills the channel and
+			// triggers a reconnect, so both arms are signalled and whichever
+			// runs first already replaces the channel. Acting on the signal
+			// alone would then close a healthy, freshly established channel —
+			// interrupting any confirm in flight on it — so the state of the
+			// current channel decides, not the signal.
+			if !p.channelDead() {
+				continue // leaves any pending retry armed
+			}
 			reason = "re-establishing channel after it was closed by the broker"
 		case <-retry:
 			reason = "retrying channel setup after a failed attempt"
@@ -582,9 +552,10 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 // DeclareExchange declares an exchange on the publisher's channel.
 //
 // A failed declaration (for example a type mismatch with an existing exchange)
-// closes the underlying channel, and the publisher only re-establishes it on
-// connection recovery — so prefer WithExchangeConfig, which declares the
-// exchange on every channel setup.
+// closes the underlying channel. The publisher re-establishes it, but the
+// exchange declared here is not re-applied — so prefer WithExchangeConfig,
+// which declares the exchange on every channel setup and so survives both a
+// channel-level exception and a reconnect.
 func (p *Publisher) DeclareExchange(name string, kind ExchangeType, durable, autoDelete bool, args map[string]any) error {
 	p.mu.RLock()
 	ch := p.channel

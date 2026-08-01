@@ -162,9 +162,15 @@ Two consequences worth knowing:
 - The operation that killed the channel is **not** replayed. A publish in
   flight when the channel dies fails and is yours to retry; recovery restores
   the channel, not the message.
-- A publish to a missing exchange usually returns `nil`, because the broker's
-  `404` arrives asynchronously. Enable `Mandatory` with `NotifyReturn`, or
-  publisher confirms, if you need to know that a message was actually routed.
+- A publish to a missing exchange usually returns `nil`: the broker answers
+  `404 NOT_FOUND` asynchronously, as a channel-level exception, so the publish
+  that caused it has already returned. The failure surfaces as the channel
+  death, not as that call's error.
+- A confirm is not proof of routing. Publisher confirms tell you the broker
+  accepted the message; a message published to an exchange with no matching
+  queue is confirmed and then silently dropped. To detect that, publish with
+  `Mandatory` and register `NotifyReturn` — the broker returns the unroutable
+  message to the handler.
 
 ### Logging
 
