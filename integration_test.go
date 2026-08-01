@@ -3130,3 +3130,490 @@ func TestIntegration_ConsumerRecoversFromChannelException(t *testing.T) {
 		t.Error("connection was reconnected; the channel watcher should have recovered the channel on the live connection")
 	}
 }
+
+// --- Periodic topology refresh ---
+
+// refreshConsumerConfig returns a consumer config that owns its exchange, queue
+// and binding — the topology the refresh is there to maintain.
+func refreshConsumerConfig(queue, exchange string) ConsumerConfig {
+	return DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil)
+}
+
+// declareExchangeOn declares an exchange on a fresh channel, standing in for an
+// operator or another service (re-)creating it behind the consumer's back.
+func declareExchangeOn(t *testing.T, conn *Connection, exchange string, kind ExchangeType) {
+	t.Helper()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("channel for declaring %q: %v", exchange, err)
+	}
+	defer ch.Close()
+	if err := ch.Raw().ExchangeDeclare(exchange, string(kind), false /*durable*/, false /*autoDelete*/, false /*internal*/, false /*noWait*/, nil); err != nil {
+		t.Fatalf("declare exchange %q as %s: %v", exchange, kind, err)
+	}
+}
+
+// underlyingConn returns the current AMQP connection, for asserting that a
+// recovery did not come from a reconnect.
+func underlyingConn(conn *Connection) *amqp.Connection {
+	conn.mu.RLock()
+	defer conn.mu.RUnlock()
+	return conn.conn
+}
+
+// TestIntegration_TopologyRefreshRestoresDeletedBinding pins the bug the
+// refresh exists for: deleting an exchange destroys its bindings, but leaves
+// the queue, the channel and the consume valid. Nothing in AMQP reports that,
+// so without the refresh the consumer stays alive and silently receives nothing
+// for the rest of the process — publishes still succeed, and the messages are
+// dropped at the exchange.
+func TestIntegration_TopologyRefreshRestoresDeletedBinding(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	consumer, err := NewConsumer(conn, refreshConsumerConfig(queue, exchange).
+		WithTopologyRefresh(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test").
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the deletion: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	before := underlyingConn(conn)
+
+	// Delete the exchange out from under the consumer, taking its binding with
+	// it. The publisher re-creates the exchange when its own channel dies on
+	// the resulting NOT_FOUND, so the binding is the only thing still missing.
+	deleteExchange(t, conn, exchange)
+
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+
+	if !conn.IsHealthy() {
+		t.Error("connection should have stayed healthy throughout")
+	}
+	if after := underlyingConn(conn); before != after {
+		t.Error("connection was reconnected; the topology refresh should have restored the binding on the live connection")
+	}
+}
+
+// TestIntegration_TopologyRefreshRebindsToForeignExchange covers the common
+// shape of the bug: the exchange belongs to another service, so the consumer
+// only binds to it and never declares it. The binding is still collateral
+// damage when its owner re-creates the exchange, and the refresh is the only
+// thing that puts it back.
+func TestIntegration_TopologyRefreshRebindsToForeignExchange(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	declareExchangeOn(t, conn, exchange, ExchangeTopic)
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil).
+		WithTopologyRefresh(300*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the deletion: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	before := underlyingConn(conn)
+
+	// The owner re-creates its exchange; the consumer is told nothing.
+	deleteExchange(t, conn, exchange)
+	declareExchangeOn(t, conn, exchange, ExchangeTopic)
+
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+
+	if after := underlyingConn(conn); before != after {
+		t.Error("connection was reconnected; the topology refresh should have restored the binding on the live connection")
+	}
+}
+
+// TestIntegration_TopologyRefreshDisabled pins the opt-out: with the refresh
+// disabled the destroyed binding is never restored, and published messages are
+// dropped at the exchange with no error anywhere.
+func TestIntegration_TopologyRefreshDisabled(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	consumer, err := NewConsumer(conn, refreshConsumerConfig(queue, exchange).
+		WithTopologyRefresh(TopologyRefreshDisabled))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the deletion: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Delete the exchange and put it straight back, so the publish below cannot
+	// fail on a missing exchange: only the binding is gone.
+	deleteExchange(t, conn, exchange)
+	declareExchangeOn(t, conn, exchange, ExchangeTopic)
+
+	if err := pub.Publish(ctx, NewTextMessage("dropped")); err != nil {
+		t.Fatalf("publish after the deletion: %v", err)
+	}
+
+	select {
+	case d, ok := <-deliveryCh:
+		if ok {
+			t.Fatalf("received %q with the refresh disabled; the binding should have stayed gone", d.Body)
+		}
+		t.Fatal("delivery channel closed unexpectedly")
+	case <-time.After(3 * time.Second):
+		// Expected: unbound queue, message dropped at the exchange.
+	}
+}
+
+// TestIntegration_TopologyRefreshKeepsServerNamedQueue verifies that the
+// refresh never re-declares an anonymous queue: an empty name asks the broker
+// for a *new* queue, which would leave the consumer bound to one queue and
+// consuming from another.
+func TestIntegration_TopologyRefreshKeepsServerNamedQueue(t *testing.T) {
+	conn := integrationConn(t)
+	exchange := uniqueQueue(t) + ".ex"
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+		WithBinding(exchange, "evt.*", nil).
+		WithTopologyRefresh(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	name := consumer.QueueName()
+	if name == "" {
+		t.Fatal("expected a server-assigned queue name")
+	}
+
+	// Several refreshes' worth of ticks.
+	time.Sleep(time.Second)
+
+	if got := consumer.QueueName(); got != name {
+		t.Errorf("queue name changed from %q to %q; the refresh re-declared the anonymous queue", name, got)
+	}
+	if err := pub.Publish(ctx, NewTextMessage("after-refresh")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "after-refresh")
+}
+
+// TestIntegration_TopologyRefreshFailureSparesConsumingChannel verifies the
+// isolation the refresh buys by running on its own channel: a declaration that
+// cannot succeed (here an exchange re-created with a different type) is
+// reported, tick after tick, without closing the channel deliveries are being
+// consumed on — which would drop every unacknowledged message with it.
+func TestIntegration_TopologyRefreshFailureSparesConsumingChannel(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	consumer, err := NewConsumer(conn, refreshConsumerConfig(queue, exchange).
+		WithTopologyRefresh(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	// Publish through the default exchange, which no amount of meddling with
+	// the consumer's own exchange can affect.
+	if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the conflict: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	before := underlyingConn(conn)
+
+	// Re-create the exchange with a type the consumer cannot re-declare: every
+	// refresh from here on fails with PRECONDITION_FAILED.
+	deleteExchange(t, conn, exchange)
+	declareExchangeOn(t, conn, exchange, ExchangeDirect)
+
+	time.Sleep(time.Second) // several failing refreshes
+
+	if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage("after")); err != nil {
+		t.Fatalf("publish after the conflict: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "after")
+
+	if after := underlyingConn(conn); before != after {
+		t.Error("connection was reconnected; a failing refresh must not disturb the connection")
+	}
+}
+
+// TestIntegration_TopologyRefreshSurvivesReconnect exercises the refresh
+// against the one moving part it shares with channel setup: the name of a
+// server-named queue, which changes on every reconnect. A refresh landing
+// mid-reconnect must not bind the discarded queue for good, or leave the
+// consumer bound to one queue and consuming another.
+func TestIntegration_TopologyRefreshSurvivesReconnect(t *testing.T) {
+	conn := integrationConn(t)
+	exchange := uniqueQueue(t) + ".ex"
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+		WithBinding(exchange, "evt.*", nil).
+		WithTopologyRefresh(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test").
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	origName := consumer.QueueName()
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the reconnect: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	if err := underlyingConn(conn).Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	newName := waitForReDeclaredQueue(t, consumer, origName)
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+
+	// Several refreshes after the reconnect: the binding the refresh maintains
+	// must still be the queue being consumed from.
+	time.Sleep(time.Second)
+	if got := consumer.QueueName(); got != newName {
+		t.Errorf("queue name changed from %q to %q after the reconnect settled", newName, got)
+	}
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after-refresh")
+}
+
+// queueDepth reports a queue's ready-message count via a passive declare on a
+// fresh channel.
+func queueDepth(t *testing.T, conn *Connection, queue string) int {
+	t.Helper()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("channel for inspecting %q: %v", queue, err)
+	}
+	defer ch.Close()
+	q, err := ch.Raw().QueueDeclarePassive(queue, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, nil)
+	if err != nil {
+		t.Fatalf("inspect queue %q: %v", queue, err)
+	}
+	return q.Messages
+}
+
+// TestIntegration_TopologyRefreshStopsOnClose verifies the refresh loop is
+// really shut down with the consumer: a closed consumer must not go on
+// declaring topology on the caller's connection.
+func TestIntegration_TopologyRefreshStopsOnClose(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	// A durable, non-auto-delete queue outlives the consumer, so the binding can
+	// still be inspected after Close.
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(true)).
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)).
+		WithBinding(exchange, "evt.*", nil).
+		WithTopologyRefresh(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	if err := consumer.Close(); err != nil {
+		t.Fatalf("close consumer: %v", err)
+	}
+
+	// Destroy the binding the way the refresh is meant to repair it.
+	deleteExchange(t, conn, exchange)
+	declareExchangeOn(t, conn, exchange, ExchangeTopic)
+
+	time.Sleep(time.Second) // several refresh intervals, had one still been running
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := pub.Publish(ctx, NewTextMessage("after-close")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond) // let the broker route it, if it can
+
+	if depth := queueDepth(t, conn, queue); depth != 0 {
+		t.Errorf("queue depth = %d, want 0: a closed consumer restored its binding", depth)
+	}
+}
+
+// TestIntegration_TopologyRefreshCloseRace repeatedly builds and closes a
+// consumer with a refresh interval short enough to be mid-flight when Close
+// runs. Under -race this is the check that stopping the loop is not racy and
+// that Close is never left waiting on it.
+func TestIntegration_TopologyRefreshCloseRace(t *testing.T) {
+	conn := integrationConn(t)
+	exchange := uniqueQueue(t) + ".ex"
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	for i := range 8 {
+		consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+			WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+			WithBinding(exchange, "evt.*", nil).
+			WithTopologyRefresh(5*time.Millisecond))
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if _, err := consumer.Start(ctx); err != nil {
+			cancel()
+			consumer.Close()
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+		// Let the consume loop finish its basic.consume. Closing inside that
+		// window races the consume loop — a pre-existing hazard that has
+		// nothing to do with the refresh, and would only add noise here.
+		time.Sleep(50 * time.Millisecond)
+
+		done := make(chan error, 1)
+		go func() { done <- consumer.Close() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("iteration %d: close: %v", i, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d: Close blocked; the refresh loop did not stop", i)
+		}
+		cancel()
+	}
+}

@@ -78,20 +78,52 @@ type ConsumerConfig struct {
 	// and wires the work queue to dead-letter into it — on every channel setup,
 	// initially and after each reconnect. Set it with WithDeadLetterQueue.
 	DeadLetter *DeadLetterConfig
+
+	// TopologyRefreshInterval is how often the declared topology (Exchanges,
+	// QueueConfig, Bindings, DeadLetter) is re-applied while the consumer runs,
+	// repairing topology destroyed behind the consumer's back. Zero selects the
+	// default of 30s; TopologyRefreshDisabled turns it off. Set it with
+	// WithTopologyRefresh.
+	//
+	// Channel setup only runs on connection loss and channel death, and neither
+	// is signalled when the broker destroys topology under a healthy channel:
+	// deleting an exchange takes its bindings with it, yet leaves the queue,
+	// the channel and the consume valid, so the consumer stays alive and
+	// receives nothing. Nothing in AMQP announces that, so the only way to
+	// notice is to re-declare periodically. Declaring is idempotent, so a
+	// refresh is a no-op unless something is actually missing.
+	//
+	// Re-declaring a queue also counts as using it, so a queue declared with
+	// x-expires does not expire while a consumer declaring it is alive, even
+	// one that never consumes.
+	TopologyRefreshInterval time.Duration
 }
+
+// TopologyRefreshDisabled disables the periodic topology refresh when passed to
+// WithTopologyRefresh or set as ConsumerConfig.TopologyRefreshInterval. A zero
+// interval selects the default instead, so opting out has to be explicit.
+const TopologyRefreshDisabled = -1 * time.Nanosecond
+
+// defaultTopologyRefreshInterval is how often a consumer re-applies its
+// declared topology when TopologyRefreshInterval is left at zero. Each refresh
+// costs a handful of idempotent declares on a channel the consumer already
+// holds, so the interval trades broker chatter against how long a consumer can
+// silently miss messages after its bindings are destroyed.
+const defaultTopologyRefreshInterval = 30 * time.Second
 
 // DefaultConsumerConfig returns a default consumer configuration.
 func DefaultConsumerConfig() ConsumerConfig {
 	return ConsumerConfig{
-		AutoAck:          false,
-		Exclusive:        false,
-		NoLocal:          false,
-		NoWait:           false,
-		PrefetchCount:    10,
-		PrefetchSize:     0,
-		RequeueOnError:   false,
-		Concurrency:      1,
-		GracefulShutdown: true,
+		AutoAck:                 false,
+		Exclusive:               false,
+		NoLocal:                 false,
+		NoWait:                  false,
+		PrefetchCount:           10,
+		PrefetchSize:            0,
+		RequeueOnError:          false,
+		Concurrency:             1,
+		GracefulShutdown:        true,
+		TopologyRefreshInterval: defaultTopologyRefreshInterval,
 	}
 }
 
@@ -190,6 +222,20 @@ func (c ConsumerConfig) WithExchangeConfig(ec ExchangeConfig) ConsumerConfig {
 	return c
 }
 
+// WithTopologyRefresh returns a new config that re-applies the declared
+// topology every interval, so bindings destroyed behind the consumer's back are
+// restored without a reconnect. Pass TopologyRefreshDisabled to turn the
+// refresh off, or zero to select the 30s default.
+//
+// The refresh runs on its own channel, so a failing declaration (an exchange
+// re-created with a different type, say) is reported without disturbing the
+// channel messages are consumed on. It is a no-op for a consumer that declares
+// no topology of its own.
+func (c ConsumerConfig) WithTopologyRefresh(interval time.Duration) ConsumerConfig {
+	c.TopologyRefreshInterval = interval
+	return c
+}
+
 // WithBinding returns a new config that binds the consumed queue to the given
 // exchange on every channel setup — initially and after each reconnect. Call
 // it multiple times to add several bindings. The exchange must exist when the
@@ -262,6 +308,11 @@ type Consumer struct {
 	log        Logger
 	handlerWg  sync.WaitGroup
 	retryDelay time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
+	// stopRefresh stops the topology refresh loop; closed by CloseWithContext,
+	// which then waits for refreshWg. Both are zero-valued when no refresh loop
+	// runs (nothing declared, or refreshing disabled).
+	stopRefresh chan struct{}
+	refreshWg   sync.WaitGroup
 }
 
 // NewConsumer creates a new consumer.
@@ -273,6 +324,8 @@ type Consumer struct {
 // Topology configured with WithQueueConfig and WithBinding is re-applied on
 // every channel setup — initially and after each reconnect — so declared
 // queues and bindings survive connection loss without manual re-declaration.
+// It is also re-applied periodically (see WithTopologyRefresh), which covers
+// topology destroyed while the connection and channel stay healthy.
 func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 	if conn == nil {
 		return nil, ErrNilConnection
@@ -310,6 +363,8 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 		conn.unsubscribeReconnect(c.reconnectCh)
 		return nil, err
 	}
+
+	c.startTopologyRefresh()
 
 	return c, nil
 }
@@ -374,22 +429,41 @@ func (c *Consumer) isCurrentChannel(ch *Channel) bool {
 // applyTopology declares the configured exchanges and queue and applies the
 // configured bindings on the given channel, returning the resolved queue name.
 func (c *Consumer) applyTopology(ch *Channel) (string, error) {
-	// Declare the configured exchanges first: binding to a missing exchange
-	// fails with NOT_FOUND and closes the channel.
-	for _, ec := range c.config.Exchanges {
-		if err := declareExchange(ch, ec); err != nil {
-			return "", fmt.Errorf("declare exchange %q: %w", ec.Name, err)
-		}
-	}
-
-	// Declare the dead-letter topology next so the work queue's
-	// x-dead-letter-exchange target exists before the work queue is declared.
-	if err := c.applyDeadLetter(ch); err != nil {
+	if err := c.declareExchanges(ch); err != nil {
 		return "", err
 	}
 
-	queueName := c.config.Queue
+	queueName, err := c.declareQueue(ch)
+	if err != nil {
+		return "", err
+	}
 
+	if err := c.applyBindings(ch, queueName); err != nil {
+		return "", err
+	}
+
+	return queueName, nil
+}
+
+// declareExchanges declares the configured exchanges and the dead-letter
+// topology. It runs before the queue is declared, because the work queue's
+// x-dead-letter-exchange target must exist first, and before any binding,
+// because binding to a missing exchange fails with NOT_FOUND and closes the
+// channel.
+func (c *Consumer) declareExchanges(ch *Channel) error {
+	for _, ec := range c.config.Exchanges {
+		if err := declareExchange(ch, ec); err != nil {
+			return fmt.Errorf("declare exchange %q: %w", ec.Name, err)
+		}
+	}
+
+	return c.applyDeadLetter(ch)
+}
+
+// declareQueue declares the configured queue on the given channel and returns
+// the name to consume from. Without a QueueConfig and with a queue name given,
+// the queue belongs to somebody else and is left alone.
+func (c *Consumer) declareQueue(ch *Channel) (string, error) {
 	switch {
 	case c.config.QueueConfig != nil:
 		qc := c.config.QueueConfig
@@ -397,7 +471,7 @@ func (c *Consumer) applyTopology(ch *Channel) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("declare queue %q: %w", qc.Name, err)
 		}
-		queueName = q.Name
+		return q.Name, nil
 	case c.serverNamed:
 		// No queue named: declare a private, server-named queue that lives and
 		// dies with this connection (exclusive + auto-delete). The previous one
@@ -406,16 +480,21 @@ func (c *Consumer) applyTopology(ch *Channel) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("declare server-named queue: %w", err)
 		}
-		queueName = q.Name
+		return q.Name, nil
+	default:
+		return c.config.Queue, nil
 	}
+}
 
+// applyBindings binds queueName to every configured exchange.
+func (c *Consumer) applyBindings(ch *Channel, queueName string) error {
 	for _, b := range c.config.Bindings {
 		if err := ch.ch.QueueBind(queueName, b.RoutingKey, b.Exchange, false /*noWait*/, amqp.Table(b.Args)); err != nil {
-			return "", fmt.Errorf("bind queue %q to exchange %q: %w", queueName, b.Exchange, err)
+			return fmt.Errorf("bind queue %q to exchange %q: %w", queueName, b.Exchange, err)
 		}
 	}
 
-	return queueName, nil
+	return nil
 }
 
 // applyDeadLetter idempotently declares the configured dead-letter exchange,
@@ -441,6 +520,159 @@ func (c *Consumer) applyDeadLetter(ch *Channel) error {
 
 	if err := ch.ch.QueueBind(dl.Queue, dl.RoutingKey, dl.Exchange, false /*noWait*/, nil); err != nil {
 		return fmt.Errorf("bind dead-letter queue %q to exchange %q: %w", dl.Queue, dl.Exchange, err)
+	}
+
+	return nil
+}
+
+// declaresTopology reports whether this consumer declares any topology of its
+// own. A consumer that only reads from somebody else's queue has nothing to
+// refresh, so it should not pay for a refresh loop.
+func (c *Consumer) declaresTopology() bool {
+	return len(c.config.Exchanges) > 0 ||
+		len(c.config.Bindings) > 0 ||
+		c.config.QueueConfig != nil ||
+		c.config.DeadLetter != nil
+}
+
+// startTopologyRefresh starts the periodic topology refresh unless it is
+// disabled or there is nothing declared to refresh. It is called from
+// NewConsumer, before the consumer is shared, so it needs no locking.
+func (c *Consumer) startTopologyRefresh() {
+	interval := c.config.TopologyRefreshInterval
+	switch {
+	case interval < 0: // TopologyRefreshDisabled
+		return
+	case interval == 0:
+		interval = defaultTopologyRefreshInterval
+	}
+
+	if !c.declaresTopology() {
+		return
+	}
+
+	c.stopRefresh = make(chan struct{})
+	c.refreshWg.Add(1)
+	go c.topologyRefreshLoop(interval)
+}
+
+// topologyRefreshLoop re-applies the declared topology every interval until the
+// consumer is closed.
+//
+// It holds one channel for its lifetime rather than opening one per tick.
+// Repeatedly opening and closing channels churns channel ids on the shared
+// connection, and a client that re-opens an id the broker has not finished
+// closing is answered with a connection-level COMMAND_INVALID — which would
+// take down every publisher and consumer on that connection.
+func (c *Consumer) topologyRefreshLoop(interval time.Duration) {
+	defer c.refreshWg.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var ch *Channel
+	defer func() {
+		if ch != nil {
+			_ = ch.Close()
+		}
+	}()
+
+	for {
+		select {
+		case <-c.stopRefresh:
+			return
+		case <-ticker.C:
+			var err error
+			ch, err = c.refreshTopology(ch)
+			switch {
+			case err == nil:
+			case isConnectionDown(err), errors.Is(err, errStaleRefreshTarget):
+				// Both are transient and self-correcting: the connection is
+				// down or coming back and setupChannel will apply the topology
+				// itself, or a reconnect moved the topology under this refresh.
+				// Either way the next tick works from the settled state.
+				c.log.Debugf("consumer: topology refresh deferred: %v", err)
+			default:
+				// Worth a warning: in the steady state every declaration here is
+				// an idempotent no-op, so a failure means the topology has been
+				// changed into something this consumer cannot restore — an
+				// exchange re-created with another type, say.
+				c.log.Warnf("consumer: topology refresh failed: %v", err)
+			}
+		}
+	}
+}
+
+// isConnectionDown reports whether err just means the connection is not
+// currently usable, as opposed to a topology problem worth reporting.
+func isConnectionDown(err error) bool {
+	return errors.Is(err, ErrNotConnected) || errors.Is(err, amqp.ErrClosed)
+}
+
+// errStaleRefreshTarget marks a refresh that failed because a reconnect changed
+// the topology under it, rather than because the topology is wrong.
+var errStaleRefreshTarget = errors.New("topology changed during refresh")
+
+// refreshTopology re-declares the configured topology and re-applies the
+// configured bindings, restoring anything that was deleted while the connection
+// and the channel stayed healthy — which nothing in AMQP reports, so it can
+// only be discovered by declaring again.
+//
+// It runs on its own channel rather than on the consuming one: a failed
+// declaration closes the channel it runs on, and doing that to the consuming
+// channel would drop unacknowledged deliveries for a problem the consumer
+// cannot fix by reconnecting.
+//
+// ch is the channel from the previous refresh, or nil to open one. The channel
+// to reuse next time is returned, and is nil when a failure (or a lost
+// connection) leaves it unusable.
+func (c *Consumer) refreshTopology(ch *Channel) (*Channel, error) {
+	if ch == nil {
+		var err error
+		if ch, err = c.conn.Channel(); err != nil {
+			return nil, fmt.Errorf("open topology refresh channel: %w", err)
+		}
+	}
+
+	if err := c.applyRefresh(ch); err != nil {
+		// A failed declaration has already been answered with a channel-level
+		// exception, so this channel is spent either way.
+		_ = ch.Close()
+		return nil, err
+	}
+
+	return ch, nil
+}
+
+// applyRefresh re-applies the declared topology on ch.
+func (c *Consumer) applyRefresh(ch *Channel) error {
+	if err := c.declareExchanges(ch); err != nil {
+		return err
+	}
+
+	// A server-named queue is deliberately not re-declared: an empty name asks
+	// the broker for a *new* queue, which would leave the consumer consuming
+	// from one queue and binding another. Only setupChannel names those, and it
+	// re-declares them on the reconnect that discarded the old one.
+	if !c.serverNamed {
+		if _, err := c.declareQueue(ch); err != nil {
+			return err
+		}
+	}
+
+	// Bind the name actually being consumed from, which for a server-named
+	// queue is whatever the last setup was given.
+	queue := c.QueueName()
+	if err := c.applyBindings(ch, queue); err != nil {
+		if queue != c.QueueName() {
+			// A reconnect re-declared the server-named queue between the read
+			// above and the bind — the lock cannot be held across a broker
+			// round-trip — so this failure is about a queue that no longer
+			// exists, not about the configured topology. The next tick binds
+			// the new name.
+			return fmt.Errorf("%w: %v", errStaleRefreshTarget, err)
+		}
+		return err
 	}
 
 	return nil
@@ -779,8 +1011,10 @@ func (c *Consumer) DeleteQueue(queue string, ifUnused, ifEmpty bool) (int, error
 	return ch.ch.QueueDelete(queue, ifUnused, ifEmpty, false)
 }
 
-// Stop stops consuming without closing the underlying channel.
-// Call Close to release all resources.
+// Stop stops consuming without closing the underlying channel. The topology
+// refresh keeps running, so the declared topology is still maintained for a
+// consumer that is stopped and started again. Call Close to release all
+// resources.
 func (c *Consumer) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -817,7 +1051,16 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 
 	c.conn.unsubscribeReconnect(c.reconnectCh)
 	close(c.reconnectCh)
+	if c.stopRefresh != nil {
+		close(c.stopRefresh)
+	}
 	c.mu.Unlock()
+
+	// Stop the topology refresh before closing the channel below, so a refresh
+	// is not left declaring on a connection the caller is about to close. A
+	// caller whose context expires first gives that up, as it does for
+	// in-flight handlers.
+	c.awaitTopologyRefreshStopped(ctx)
 
 	// Wait for in-flight handlers if graceful shutdown is enabled
 	if c.config.GracefulShutdown {
@@ -851,6 +1094,37 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// refreshStopTimeout bounds how long Close waits for an in-flight topology
+// refresh to finish.
+const refreshStopTimeout = 5 * time.Second
+
+// awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by
+// refreshStopTimeout, so a refresh blocked on an unresponsive broker cannot
+// hold Close open, and by ctx, so a caller with a deadline of its own is not
+// made to wait out that cap.
+//
+// It is a no-op for a consumer that never started a refresh loop. stopRefresh
+// is written once in NewConsumer, before the consumer is shared, and Close has
+// already read it under the lock.
+func (c *Consumer) awaitTopologyRefreshStopped(ctx context.Context) {
+	if c.stopRefresh == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.refreshWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-time.After(refreshStopTimeout):
+		c.log.Warnf("consumer: topology refresh did not stop in time")
+	}
 }
 
 // IsClosed returns true if the consumer is closed.

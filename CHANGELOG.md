@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-08-01
+
+### Fixed
+
+- **A consumer no longer goes permanently deaf when its bindings are deleted.**
+  Deleting an exchange destroys its bindings, but leaves the consumer's queue,
+  channel and consume entirely valid: no error, no `basic.cancel`, no channel
+  close, and therefore nothing to trigger a re-setup. The consumer stayed alive
+  and bound to nothing for the rest of the process, while publishes kept
+  succeeding — a confirm only means the broker accepted the message, not that it
+  was routed — so every message was silently dropped at the exchange.
+
+  This was the half of channel-level recovery that 0.12.0 could not reach. A
+  publisher notices, because its next publish to the missing exchange draws a
+  404 that closes its channel; there is no equivalent signal on the consumer
+  side, which made the result worse than no recovery at all: the topology *looks*
+  healthy — exchange present, queue present, consumer attached — and nothing
+  anywhere reports a problem.
+
+  Since AMQP announces nothing, the only way to notice is to declare again.
+  Consumers that declare topology now re-apply it periodically, restoring
+  anything that has been deleted behind their backs.
+
+### Added
+
+- **`WithTopologyRefresh` — periodic re-declaration of a consumer's topology.**
+  Enabled by default at 30s; pass `rabbitmq.TopologyRefreshDisabled` to turn it
+  off, or any interval to tune it. A zero interval selects the default, so
+  opting out is always explicit.
+
+  ```go
+  consConfig := rabbitmq.DefaultConsumerConfig().
+      WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic)).
+      WithQueueConfig(rabbitmq.DefaultQueueConfig("ws-fanout")).
+      WithBinding("events", "user.*", nil).
+      WithTopologyRefresh(10 * time.Second)
+  ```
+
+  Every declaration involved is idempotent, so a refresh is a no-op unless
+  something is actually missing, and a consumer that declares no topology of its
+  own never starts the refresh at all.
+
+  The refresh runs on its own channel rather than on the consuming one. A
+  declaration that cannot succeed — an exchange re-created with a different
+  type, say — is reported as a warning each interval instead of closing the
+  channel deliveries are consumed on, which would drop every unacknowledged
+  message with it.
+
+  That channel is opened once and held for the consumer's lifetime, replaced
+  only when a failure spends it. Opening one per tick churns channel ids on the
+  shared connection, and re-opening an id the broker has not finished closing is
+  answered with a connection-level `COMMAND_INVALID` that would take down every
+  publisher and consumer using it.
+
+  A server-named (anonymous) queue is deliberately not re-declared: an empty
+  name asks the broker for a *new* queue. Those are still re-declared by channel
+  setup, which is what assigns their name in the first place.
+
+  Publishers need no equivalent: a publish to a missing exchange kills the
+  publisher's channel, and 0.12.0's recovery re-declares the exchange when it
+  re-establishes.
+
 ## [0.12.0] - 2026-08-01
 
 ### Fixed

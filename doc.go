@@ -89,6 +89,12 @@
 // the service that owns it: binding to an exchange that does not exist yet
 // fails with NOT_FOUND and the broker closes the channel.
 //
+// A consumer also re-applies its declared topology every 30s by default, which
+// covers topology destroyed while the connection and channel stay healthy —
+// deleting an exchange takes its bindings with it, and no AMQP event reports
+// that, so the consumer would otherwise stay alive and silently receive
+// nothing. Tune or disable it with WithTopologyRefresh.
+//
 // # Middleware
 //
 // The package includes built-in middleware for common patterns:
