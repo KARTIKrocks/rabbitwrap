@@ -299,7 +299,9 @@ type Consumer struct {
 	queue       string // resolved queue name actually consumed from
 	mu          sync.RWMutex
 	closed      bool
-	cancelFns   []context.CancelFunc
+	// loops holds one handle per consume loop started by Start, so Stop and
+	// Close can both cancel them and wait for them to be gone.
+	loops       []consumeLoopHandle
 	reconnectCh chan struct{}
 	// chDeadCh carries "the current channel died" from the per-channel close
 	// watcher to the consume loop. Buffered and signalled non-blockingly, so
@@ -709,11 +711,39 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 
 	outCh := make(chan *Delivery)
 	ctx, cancel := context.WithCancel(ctx)
-	c.cancelFns = append(c.cancelFns, cancel)
 
-	go c.consumeLoop(ctx, outCh)
+	// Register the loop before starting it, so a Stop or Close that follows
+	// cannot miss it.
+	done := make(chan struct{})
+	c.loops = append(c.loops, consumeLoopHandle{cancel: cancel, done: done})
+
+	go func() {
+		defer close(done)
+		c.consumeLoop(ctx, outCh)
+	}()
 
 	return outCh, nil
+}
+
+// consumeLoopHandle is one running consume loop: the cancel that stops it, and
+// a channel closed once its goroutine has actually returned. Waiting for the
+// latter is what makes it safe to close the channel the loop consumes on — see
+// awaitConsumeLoopsStopped.
+type consumeLoopHandle struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+// stopConsumeLoops cancels every running consume loop and returns their
+// handles, so the caller can wait for them after releasing the lock — which it
+// must, since the loops take c.mu themselves. Callers must hold c.mu.
+func (c *Consumer) stopConsumeLoops() []consumeLoopHandle {
+	loops := c.loops
+	c.loops = nil
+	for _, l := range loops {
+		l.cancel()
+	}
+	return loops
 }
 
 // defaultConsumeRetryDelay is the default for Consumer.retryDelay: how long the
@@ -749,7 +779,23 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		// still open but unusable — the queue was deleted, say — so retry setup
 		// on a timer too, and the loop never blocks forever.
 	}
+
+	// Several arms can be ready at once and select picks among them at random,
+	// so cancellation can lose to a signal that arrived alongside it. Check
+	// again rather than spend broker round-trips establishing a channel the loop
+	// is about to abandon — round-trips Close is waiting out (see
+	// awaitConsumeLoopsStopped).
+	if ctx.Err() != nil {
+		return false
+	}
+
 	if err := c.setupChannel(); err != nil {
+		if errors.Is(err, ErrShuttingDown) {
+			// The consumer was closed while the setup was in flight. Its channel
+			// is on its way out, so consuming again would only add a request for
+			// Close to wait out.
+			return false
+		}
 		c.log.Errorf("consumer: failed to re-establish channel: %v", err)
 	}
 	return true
@@ -760,6 +806,15 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 	defer close(outCh)
 
 	for {
+		// Nothing below is worth starting once this loop is finished, and a
+		// basic.consume issued here is one Close has to wait out before it can
+		// close the channel. Matters most on the first iteration, which is
+		// reached without going through waitForReconnect: a Close that follows
+		// Start immediately cancels the loop before it ever runs.
+		if ctx.Err() != nil {
+			return
+		}
+
 		c.mu.RLock()
 		ch := c.channel
 		queue := c.queue
@@ -1015,14 +1070,23 @@ func (c *Consumer) DeleteQueue(queue string, ifUnused, ifEmpty bool) (int, error
 // refresh keeps running, so the declared topology is still maintained for a
 // consumer that is stopped and started again. Call Close to release all
 // resources.
+//
+// It returns once the consume loops have actually stopped, not merely once
+// they have been asked to: a request one of them still has outstanding must not
+// be left to race whatever touches the channel next — including the
+// basic.consume of a Start that follows (see awaitConsumeLoopsStopped). The
+// wait is normally immediate and is bounded by consumeLoopStopTimeout.
+//
+// Stopping does not cancel the subscription at the broker, which happens only
+// when the channel is closed, so every Start after a Stop adds another consumer
+// to the queue and the queue's consumer count grows with each cycle. Close the
+// consumer and create a new one rather than cycling one through stop/start.
 func (c *Consumer) Stop() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	loops := c.stopConsumeLoops()
+	c.mu.Unlock()
 
-	for _, cancel := range c.cancelFns {
-		cancel()
-	}
-	c.cancelFns = nil
+	c.awaitConsumeLoopsStopped(loops)
 }
 
 // Close closes the consumer. If GracefulShutdown is enabled (default),
@@ -1034,6 +1098,13 @@ func (c *Consumer) Close() error {
 // CloseWithContext closes the consumer with a context for controlling the
 // graceful shutdown timeout. If the context is cancelled before handlers
 // complete, the consumer closes immediately.
+//
+// The context bounds the waits that exist for the caller's benefit — draining
+// in-flight handlers and stopping the topology refresh. Close still waits
+// briefly for the consume loops to leave the channel alone, whatever the
+// context says, because closing a channel with a request outstanding on it can
+// break the whole connection (see awaitConsumeLoopsStopped). It is safe to call
+// Close immediately after Start.
 func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	c.mu.Lock()
 
@@ -1043,11 +1114,7 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	}
 
 	c.closed = true
-
-	for _, cancel := range c.cancelFns {
-		cancel()
-	}
-	c.cancelFns = nil
+	loops := c.stopConsumeLoops()
 
 	c.conn.unsubscribeReconnect(c.reconnectCh)
 	close(c.reconnectCh)
@@ -1061,6 +1128,10 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	// caller whose context expires first gives that up, as it does for
 	// in-flight handlers.
 	c.awaitTopologyRefreshStopped(ctx)
+
+	// Then stop consuming, so nothing is on the wire when the channel is closed
+	// below and no further deliveries reach the handlers drained after this.
+	c.awaitConsumeLoopsStopped(loops)
 
 	// Wait for in-flight handlers if graceful shutdown is enabled
 	if c.config.GracefulShutdown {
@@ -1099,6 +1170,45 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 // refreshStopTimeout bounds how long Close waits for an in-flight topology
 // refresh to finish.
 const refreshStopTimeout = 5 * time.Second
+
+// consumeLoopStopTimeout bounds the total time Stop and Close wait for the
+// consume loops they cancelled to exit.
+const consumeLoopStopTimeout = 5 * time.Second
+
+// awaitConsumeLoopsStopped waits for already-cancelled consume loops to return,
+// so that nothing else touches the channel they consume on while one of their
+// requests is still outstanding.
+//
+// Cancelling a loop does not abort an AMQP round-trip it already has on the
+// wire, and issuing another request alongside that one is not merely wasteful:
+// amqp091 does not serialise synchronous calls on a channel, so both wait on
+// the same rpc channel and either can be handed the other's reply. A channel
+// closed that way blocks until the connection dies and never releases its
+// channel id, and enough abandoned ids earn a connection-level exception that
+// takes down every publisher and consumer sharing the connection.
+//
+// The wait deliberately takes no context. It protects a connection the caller
+// shares with unrelated publishers and consumers, so it is not theirs to trade
+// away for a faster shutdown, and consumeLoopStopTimeout — which bounds the
+// whole set, not each loop — already caps it. It normally costs nothing, since
+// the loops leave on the cancellation the caller has already issued.
+func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) {
+	if len(loops) == 0 {
+		return
+	}
+
+	timeout := time.NewTimer(consumeLoopStopTimeout)
+	defer timeout.Stop()
+
+	for _, l := range loops {
+		select {
+		case <-l.done:
+		case <-timeout.C:
+			c.log.Warnf("consumer: consume loop did not stop in time")
+			return
+		}
+	}
+}
 
 // awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by
 // refreshStopTimeout, so a refresh blocked on an unresponsive broker cannot

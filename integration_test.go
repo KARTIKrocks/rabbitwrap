@@ -1300,6 +1300,195 @@ func TestIntegration_ConsumerClose(t *testing.T) {
 	}
 }
 
+// TestIntegration_ConsumerCloseImmediatelyAfterStart closes consumers inside the
+// window where the consume loop still has its basic.consume on the wire.
+//
+// amqp091 does not serialise synchronous calls on a channel, so a channel.close
+// sent while a request is outstanding can be answered with that request's reply
+// and vice versa: Close blocks until the connection dies and the channel id is
+// never released. Enough abandoned ids earn a connection-level exception, which
+// takes down every other publisher and consumer on the shared connection — so
+// the assertions are about the *connection*, not just about these consumers.
+//
+// Before the fix this reproduced within ~60 cycles: Close after Close hitting
+// its 5s timeout, then a 504 CHANNEL_ERROR that left the connection unusable.
+func TestIntegration_ConsumerCloseImmediatelyAfterStart(t *testing.T) {
+	conn := integrationConn(t)
+
+	var disconnects atomic.Int32
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during create/Start/Close cycles: %v", err)
+		disconnects.Add(1)
+	})
+
+	// Both entry points spawn the consume loop; Consume adds handler goroutines
+	// that Close also has to unwind.
+	for _, start := range []struct {
+		name string
+		run  func(*Consumer, context.Context) error
+	}{
+		{"Start", func(c *Consumer, ctx context.Context) error {
+			_, err := c.Start(ctx)
+			return err
+		}},
+		{"Consume", func(c *Consumer, ctx context.Context) error {
+			go c.Consume(ctx, func(context.Context, *Delivery) error { return nil })
+			return nil
+		}},
+	} {
+		t.Run(start.name, func(t *testing.T) {
+			for i := range 30 {
+				// A server-named queue declares nothing, so no topology refresh
+				// runs and the consume loop is the only thing Close waits for.
+				consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+				if err != nil {
+					t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				if err := start.run(consumer, ctx); err != nil {
+					cancel()
+					consumer.Close()
+					t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+				}
+
+				// No delay: closing here is the whole point of the test.
+				began := time.Now()
+				if err := consumer.Close(); err != nil {
+					t.Fatalf("iteration %d: close: %v", i, err)
+				}
+				if took := time.Since(began); took > 2*time.Second {
+					t.Fatalf("iteration %d: close took %s, expected it not to wait out a timeout", i, took)
+				}
+				cancel()
+
+				if disconnects.Load() != 0 {
+					t.FailNow() // OnDisconnect already reported it
+				}
+			}
+		})
+	}
+
+	// The connection must still be usable by everything else sharing it.
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the create/Start/Close cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerStopThenStart restarts a consumer with no delay after
+// stopping it, which is only safe if Stop leaves the consume loop gone rather
+// than merely cancelled: the next Start issues its basic.consume on the same
+// channel, and two synchronous requests outstanding on one channel can be
+// handed each other's replies — see
+// TestIntegration_ConsumerCloseImmediatelyAfterStart for what that costs.
+func TestIntegration_ConsumerStopThenStart(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during Stop/Start cycles: %v", err)
+	})
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for i := range 30 {
+		deliveryCh, err := consumer.Start(ctx)
+		if err != nil {
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// Give the loop time to get its basic.consume on the wire on some
+		// iterations, so Stop lands both before and during one.
+		if i%2 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+
+		began := time.Now()
+		consumer.Stop()
+		if took := time.Since(began); took > 2*time.Second {
+			t.Fatalf("iteration %d: Stop took %s, expected it not to wait out a timeout", i, took)
+		}
+
+		// The loop closes its delivery channel as it returns, so an open one
+		// here means Stop came back while the loop was still running — and a
+		// request it still had outstanding would race the next Start.
+		select {
+		case _, ok := <-deliveryCh:
+			if ok {
+				t.Fatalf("iteration %d: unexpected delivery on an empty queue", i)
+			}
+		default:
+			t.Fatalf("iteration %d: Stop returned before the consume loop stopped", i)
+		}
+	}
+
+	if consumer.IsClosed() {
+		t.Fatal("Stop should not close the consumer")
+	}
+
+	// Nothing else on the connection may have been disturbed. A round trip on
+	// this consumer would not be a fair check: a stopped loop leaves its
+	// subscription registered at the broker, so the queue now has 30 consumers
+	// to round-robin between.
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the Stop/Start cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// assertRoundTrip publishes a message on conn and requires a consumer on the
+// same connection to receive it, proving the connection is still fully usable.
+func assertRoundTrip(t *testing.T, conn *Connection) {
+	t.Helper()
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("round trip: failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("round trip: failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("round trip: failed to start consumer: %v", err)
+	}
+
+	if err := pub.PublishText(ctx, "round-trip"); err != nil {
+		t.Fatalf("round trip: failed to publish: %v", err)
+	}
+
+	select {
+	case d, ok := <-deliveryCh:
+		if !ok {
+			t.Fatal("round trip: delivery channel closed before a message arrived")
+		}
+		if got := string(d.Body); got != "round-trip" {
+			t.Fatalf("round trip: got %q, want %q", got, "round-trip")
+		}
+		d.Ack(false)
+	case <-ctx.Done():
+		t.Fatal("round trip: no message delivered; the connection is not fully usable")
+	}
+}
+
 // --- Delayed Publishing ---
 
 func TestIntegration_PublishDelayed(t *testing.T) {
@@ -3599,11 +3788,9 @@ func TestIntegration_TopologyRefreshCloseRace(t *testing.T) {
 			consumer.Close()
 			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
 		}
-		// Let the consume loop finish its basic.consume. Closing inside that
-		// window races the consume loop — a pre-existing hazard that has
-		// nothing to do with the refresh, and would only add noise here.
-		time.Sleep(50 * time.Millisecond)
-
+		// Closed with no delay: the consume loop's basic.consume is still in
+		// flight, which Close is required to handle (see
+		// TestIntegration_ConsumerCloseImmediatelyAfterStart).
 		done := make(chan error, 1)
 		go func() { done <- consumer.Close() }()
 		select {

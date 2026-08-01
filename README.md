@@ -415,6 +415,11 @@ defer cancel()
 consumer.CloseWithContext(ctx)
 ```
 
+The deadline covers draining in-flight handlers. Close always takes the moment
+it needs to stop consuming first, however tight the deadline, because closing a
+channel with a request still outstanding on it can break the whole connection —
+so closing a consumer is safe at any point, including immediately after `Start`.
+
 ### Manual Message Handling
 
 ```go

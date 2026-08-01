@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-08-01
+
+### Fixed
+
+- **Closing a consumer no longer risks taking down the whole connection.**
+  `Close` closed the channel without waiting for the consume loop, so a `Close`
+  that followed `Start` closely enough landed while the loop still had its
+  `basic.consume` on the wire.
+
+  amqp091 does not serialise synchronous calls on a channel: both requests wait
+  on the same internal rpc channel, and either can be handed the other's reply.
+  The `channel.close` then never completes — it blocks until the connection
+  dies, and the channel id is never released — so the damage is not confined to
+  the consumer being closed. Repeating it exhausted the connection: a run of 60
+  create/`Start`/`Close` cycles first turned every `Close` into a 5s timeout and
+  then killed the connection outright with a `504 CHANNEL_ERROR`, after which
+  nothing sharing it could open a channel again. A `503 unexpected command
+  received` is the other way it surfaced.
+
+  `Close` now waits for the consume loops to return before closing the channel,
+  and a cancelled loop no longer issues a `basic.consume` it is about to
+  abandon. The same 60 cycles complete in about a second.
+
+  Only a `Close` racing its own `Start` was affected — a gap of a millisecond
+  was enough to avoid it — so consumers that run for any length of time were
+  never at risk. Tests and short-lived consumers were.
+
+### Changed
+
+- **`Consumer.Stop` returns once consumption has actually stopped**, rather than
+  only having asked it to. It previously returned while the loop could still
+  have a request outstanding, which a `Start` called straight afterwards would
+  then race in exactly the way described above. The wait is normally immediate
+  and is capped at 5s.
+
+  `Stop` still does not cancel the subscription at the broker — only closing the
+  channel does that — so each `Start` after a `Stop` adds another consumer to
+  the queue. Close the consumer and create a new one instead of cycling one
+  through stop/start.
+
 ## [0.13.0] - 2026-08-01
 
 ### Fixed
