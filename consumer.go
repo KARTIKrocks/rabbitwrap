@@ -1092,7 +1092,8 @@ type ExchangeConfig struct {
 	// Name is the exchange name.
 	Name string
 
-	// Type is the exchange type.
+	// Type is the exchange type. An empty value declares a direct exchange,
+	// the AMQP default type.
 	Type ExchangeType
 
 	// Durable makes the exchange survive broker restarts.

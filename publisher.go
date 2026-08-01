@@ -121,7 +121,16 @@ type Publisher struct {
 	log         Logger
 	onReturn    func(Return)
 	onReturnMu  sync.RWMutex
+	// setupRetryDelay is how long handleReconnect waits before retrying a
+	// failed channel setup; set before NewPublisher returns (see
+	// defaultPublisherSetupRetryDelay).
+	setupRetryDelay time.Duration
 }
+
+// defaultPublisherSetupRetryDelay is the default for Publisher.setupRetryDelay:
+// how long handleReconnect waits before retrying channel setup when no further
+// reconnect signal is coming.
+const defaultPublisherSetupRetryDelay = 5 * time.Second
 
 // NewPublisher creates a new publisher.
 func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) {
@@ -134,10 +143,11 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 	}
 
 	p := &Publisher{
-		conn:        conn,
-		config:      config,
-		reconnectCh: conn.subscribeReconnect(),
-		log:         conn.log,
+		conn:            conn,
+		config:          config,
+		reconnectCh:     conn.subscribeReconnect(),
+		log:             conn.log,
+		setupRetryDelay: defaultPublisherSetupRetryDelay,
 	}
 
 	if err := p.setupChannel(); err != nil {
@@ -178,6 +188,13 @@ func (p *Publisher) setupChannel() error {
 	}
 
 	p.mu.Lock()
+	if p.closed {
+		// The publisher was closed while this setup was in flight (a retry
+		// racing with Close); don't install a channel nobody will ever close.
+		p.mu.Unlock()
+		_ = ch.Close()
+		return ErrShuttingDown
+	}
 	p.channel = ch
 	p.mu.Unlock()
 
@@ -220,9 +237,28 @@ func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Unlock()
 }
 
-// handleReconnect re-establishes the publisher channel after connection recovery.
+// handleReconnect re-establishes the publisher channel after connection
+// recovery, retrying on a timer when setup fails.
+//
+// Setup can fail even though the connection is healthy — a configured exchange
+// may not be declarable yet — and no further reconnect signal is coming in that
+// case, so a single failed attempt would otherwise leave the publisher without
+// a usable channel until the next connection loss. The publisher only publishes
+// on a channel that completed setup.
 func (p *Publisher) handleReconnect() {
-	for range p.reconnectCh {
+	// A nil channel blocks forever, so retry only fires while one is pending.
+	var retry <-chan time.Time
+
+	for {
+		select {
+		case _, ok := <-p.reconnectCh:
+			if !ok {
+				return
+			}
+		case <-retry:
+		}
+		retry = nil
+
 		p.mu.RLock()
 		closed := p.closed
 		p.mu.RUnlock()
@@ -232,10 +268,14 @@ func (p *Publisher) handleReconnect() {
 
 		p.log.Infof("publisher: re-establishing channel after reconnect")
 		if err := p.setupChannel(); err != nil {
-			p.log.Errorf("publisher: failed to re-establish channel: %v", err)
-		} else {
-			p.log.Infof("publisher: channel re-established")
+			if errors.Is(err, ErrShuttingDown) {
+				return
+			}
+			p.log.Errorf("publisher: failed to re-establish channel: %v, retrying in %s", err, p.setupRetryDelay)
+			retry = time.After(p.setupRetryDelay)
+			continue
 		}
+		p.log.Infof("publisher: channel re-established")
 	}
 }
 

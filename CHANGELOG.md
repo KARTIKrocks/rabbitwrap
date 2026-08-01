@@ -53,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops compiling; compare the fields you care about instead. `ConsumerConfig`
   has never been comparable.
 
+### Fixed
+
+- **A publisher whose channel setup fails after a reconnect now retries** (every
+  5s) instead of waiting for the next connection loss. Setup can fail while the
+  connection is perfectly healthy — most obviously when a configured exchange
+  cannot be declared yet, or conflicts with an existing one — and no further
+  reconnect signal is coming in that case, so a single failed attempt used to
+  leave the publisher with no usable channel indefinitely. The publisher still
+  only publishes on a channel that completed setup, and a setup that finishes
+  after `Close` no longer installs a channel nobody would close.
+
 ## [0.10.0] - 2026-07-28
 
 ### Added
