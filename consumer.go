@@ -586,11 +586,12 @@ func (c *Consumer) topologyRefreshLoop(interval time.Duration) {
 			ch, err = c.refreshTopology(ch)
 			switch {
 			case err == nil:
-			case isConnectionDown(err):
-				// The connection is down or coming back; setupChannel applies
-				// the topology itself once it is, so there is nothing to warn
-				// about.
-				c.log.Debugf("consumer: topology refresh skipped: %v", err)
+			case isConnectionDown(err), errors.Is(err, errStaleRefreshTarget):
+				// Both are transient and self-correcting: the connection is
+				// down or coming back and setupChannel will apply the topology
+				// itself, or a reconnect moved the topology under this refresh.
+				// Either way the next tick works from the settled state.
+				c.log.Debugf("consumer: topology refresh deferred: %v", err)
 			default:
 				// Worth a warning: in the steady state every declaration here is
 				// an idempotent no-op, so a failure means the topology has been
@@ -607,6 +608,10 @@ func (c *Consumer) topologyRefreshLoop(interval time.Duration) {
 func isConnectionDown(err error) bool {
 	return errors.Is(err, ErrNotConnected) || errors.Is(err, amqp.ErrClosed)
 }
+
+// errStaleRefreshTarget marks a refresh that failed because a reconnect changed
+// the topology under it, rather than because the topology is wrong.
+var errStaleRefreshTarget = errors.New("topology changed during refresh")
 
 // refreshTopology re-declares the configured topology and re-applies the
 // configured bindings, restoring anything that was deleted while the connection
@@ -657,7 +662,20 @@ func (c *Consumer) applyRefresh(ch *Channel) error {
 
 	// Bind the name actually being consumed from, which for a server-named
 	// queue is whatever the last setup was given.
-	return c.applyBindings(ch, c.QueueName())
+	queue := c.QueueName()
+	if err := c.applyBindings(ch, queue); err != nil {
+		if queue != c.QueueName() {
+			// A reconnect re-declared the server-named queue between the read
+			// above and the bind — the lock cannot be held across a broker
+			// round-trip — so this failure is about a queue that no longer
+			// exists, not about the configured topology. The next tick binds
+			// the new name.
+			return fmt.Errorf("%w: %v", errStaleRefreshTarget, err)
+		}
+		return err
+	}
+
+	return nil
 }
 
 // QueueName returns the queue this consumer reads from. When NewConsumer was
@@ -1039,8 +1057,10 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	c.mu.Unlock()
 
 	// Stop the topology refresh before closing the channel below, so a refresh
-	// cannot be left declaring on a connection the caller is about to close.
-	c.awaitTopologyRefreshStopped()
+	// is not left declaring on a connection the caller is about to close. A
+	// caller whose context expires first gives that up, as it does for
+	// in-flight handlers.
+	c.awaitTopologyRefreshStopped(ctx)
 
 	// Wait for in-flight handlers if graceful shutdown is enabled
 	if c.config.GracefulShutdown {
@@ -1080,9 +1100,19 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 // refresh to finish.
 const refreshStopTimeout = 5 * time.Second
 
-// awaitTopologyRefreshStopped waits for the refresh loop to return, bounded so
-// a refresh blocked on an unresponsive broker cannot hold Close open.
-func (c *Consumer) awaitTopologyRefreshStopped() {
+// awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by
+// refreshStopTimeout, so a refresh blocked on an unresponsive broker cannot
+// hold Close open, and by ctx, so a caller with a deadline of its own is not
+// made to wait out that cap.
+//
+// It is a no-op for a consumer that never started a refresh loop. stopRefresh
+// is written once in NewConsumer, before the consumer is shared, and Close has
+// already read it under the lock.
+func (c *Consumer) awaitTopologyRefreshStopped(ctx context.Context) {
+	if c.stopRefresh == nil {
+		return
+	}
+
 	done := make(chan struct{})
 	go func() {
 		c.refreshWg.Wait()
@@ -1091,6 +1121,7 @@ func (c *Consumer) awaitTopologyRefreshStopped() {
 
 	select {
 	case <-done:
+	case <-ctx.Done():
 	case <-time.After(refreshStopTimeout):
 		c.log.Warnf("consumer: topology refresh did not stop in time")
 	}

@@ -661,6 +661,7 @@ func TestStartTopologyRefresh(t *testing.T) {
 		want   bool
 	}{
 		{"declared topology, default interval", withBinding, true},
+		{"declared topology, zero interval", withBinding.WithTopologyRefresh(0), true},
 		{"declared topology, explicit interval", withBinding.WithTopologyRefresh(time.Hour), true},
 		{"declared topology, disabled", withBinding.WithTopologyRefresh(TopologyRefreshDisabled), false},
 		{"nothing declared", DefaultConsumerConfig().WithQueue("q"), false},
@@ -670,9 +671,11 @@ func TestStartTopologyRefresh(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// A long interval keeps the loop from ever ticking, so it never
-			// touches the (absent) connection.
+			// touches the (absent) connection. A zero interval is left as it
+			// is, to exercise the branch that substitutes the default: 30s is
+			// just as safely out of reach.
 			cfg := tt.config
-			if cfg.TopologyRefreshInterval >= 0 {
+			if cfg.TopologyRefreshInterval > 0 {
 				cfg.TopologyRefreshInterval = time.Hour
 			}
 			c := &Consumer{config: cfg, log: nopLogger{}}
