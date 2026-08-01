@@ -578,6 +578,62 @@ func (c *Channel) Raw() *amqp.Channel {
 	return c.ch
 }
 
+// watchChannelClose starts the per-channel goroutine that reports a channel
+// death on dead. The broker closes the channel on any channel-level exception —
+// publishing to a missing exchange, a binding or declaration that fails — while
+// the connection stays healthy, so no reconnect signal is coming and the owner
+// would otherwise be left holding a channel it can no longer use.
+//
+// isCurrent decides whether the death is still worth reporting: channels
+// replaced by a later setup, and the graceful close done by Close, must not
+// trigger re-establishment. dead is signalled without blocking, so repeated
+// deaths coalesce into one pending re-establishment.
+//
+// A signal can still be stale by the time it is read, because a connection loss
+// both kills the channel and triggers a reconnect — whichever the reader
+// handles first replaces the channel, leaving the other signal buffered. A
+// reader for which a needless setup is costly must therefore check the current
+// channel rather than trust the signal.
+//
+// The goroutine exits when the channel closes, so there is exactly one per
+// established channel.
+func watchChannelClose(ch *Channel, log Logger, prefix string, isCurrent func(*Channel) bool, dead chan struct{}) {
+	report := func(cause *amqp.Error) {
+		if !isCurrent(ch) {
+			return
+		}
+		if cause != nil {
+			log.Warnf("%s: channel closed by broker: %v", prefix, cause)
+		} else {
+			log.Warnf("%s: channel was already closed when established", prefix)
+		}
+		select {
+		case dead <- struct{}{}:
+		default: // a re-establishment is already pending
+		}
+	}
+
+	closeCh := make(chan *amqp.Error, 1)
+	ch.ch.NotifyClose(closeCh)
+
+	// A channel that died before this registration is never reported —
+	// NotifyClose only closes the listener once the channel is shutting down —
+	// so catch that case directly instead of waiting for a signal that will
+	// never come.
+	if ch.ch.IsClosed() {
+		report(nil)
+		return
+	}
+
+	go func() {
+		amqpErr, ok := <-closeCh
+		if !ok || amqpErr == nil {
+			return // closed gracefully by us
+		}
+		report(amqpErr)
+	}()
+}
+
 // ExchangeType represents the type of exchange.
 type ExchangeType string
 

@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-08-01
+
+### Fixed
+
+- **Publishers and consumers now recover from a channel closed by the broker,
+  without waiting for a connection loss.** Any channel-level exception — most
+  easily hit by publishing to an exchange that does not exist, or by an
+  imperative `BindQueue`/`DeclareExchange` that fails — makes the broker close
+  the channel while the connection stays perfectly healthy. Nothing watched for
+  that, so no reconnect signal was ever produced:
+
+  - A **publisher** was left with a dead channel for the rest of the process.
+    Worse, the offending publish itself usually returned `nil`, because the
+    broker's 404 arrives asynchronously; every publish after it failed with
+    `504 channel/connection is not open`, forever.
+  - A **consumer** eventually recovered, but only when the consume loop's retry
+    timer fired up to 5 seconds later, and only while `Start`/`Consume` was
+    running.
+
+  Both now register a `NotifyClose` watcher per channel and re-establish as soon
+  as the broker closes one. Recovery is immediate rather than timed, and the
+  publisher recovers at all. The retry timer remains for failures a channel
+  close cannot signal, such as a deleted queue.
+
+  Consumer recovery is still driven by the consume loop, so it applies while
+  `Start`/`Consume` is running. A consumer that only ever calls the imperative
+  helpers and never consumes is not restored — use the declarative topology
+  options, which are re-applied on every channel setup.
+
+  Note that a publish in flight when the channel dies still fails; the caller is
+  responsible for retrying it. Recovery restores the channel, not the message.
+
+- A publisher's channel replaced by a new setup is now closed, as the consumer's
+  already was. Previously it leaked whenever a channel was replaced on a live
+  connection, which the recovery above makes routine.
+
 ## [0.11.0] - 2026-08-01
 
 ### Added

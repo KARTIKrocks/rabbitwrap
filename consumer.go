@@ -255,9 +255,13 @@ type Consumer struct {
 	closed      bool
 	cancelFns   []context.CancelFunc
 	reconnectCh chan struct{}
-	log         Logger
-	handlerWg   sync.WaitGroup
-	retryDelay  time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
+	// chDeadCh carries "the current channel died" from the per-channel close
+	// watcher to the consume loop. Buffered and signalled non-blockingly, so
+	// repeated deaths coalesce into one pending re-establishment.
+	chDeadCh   chan struct{}
+	log        Logger
+	handlerWg  sync.WaitGroup
+	retryDelay time.Duration // consume-loop retry delay; set before Start (see waitForReconnect)
 }
 
 // NewConsumer creates a new consumer.
@@ -298,6 +302,7 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 		queue:       queueName,
 		reconnectCh: conn.subscribeReconnect(),
 		log:         conn.log,
+		chDeadCh:    make(chan struct{}, 1),
 		retryDelay:  defaultConsumeRetryDelay,
 	}
 
@@ -350,7 +355,20 @@ func (c *Consumer) setupChannel() error {
 		_ = old.Close()
 	}
 
+	// The signal is drained by the consume loop, so re-establishment happens
+	// while Start/Consume is running; an idle consumer keeps its dead channel
+	// until it starts consuming.
+	watchChannelClose(ch, c.log, "consumer", c.isCurrentChannel, c.chDeadCh)
+
 	return nil
+}
+
+// isCurrentChannel reports whether ch is the channel the consumer is still
+// using. It is the currency test for the channel-close watcher.
+func (c *Consumer) isCurrentChannel(ch *Channel) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.channel == ch && !c.closed
 }
 
 // applyTopology declares the configured exchanges and queue and applies the
@@ -473,9 +491,10 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 // signal will ever come.
 const defaultConsumeRetryDelay = 5 * time.Second
 
-// waitForReconnect waits for a reconnection signal, a retry timeout, or
-// context cancellation, then re-establishes the channel. Returns true if the
-// caller should continue the consume loop, or false if it should exit.
+// waitForReconnect waits for a reconnection signal, a channel death, a retry
+// timeout, or context cancellation, then re-establishes the channel. Returns
+// true if the caller should continue the consume loop, or false if it should
+// exit.
 func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -484,10 +503,19 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 		if !ok {
 			return false
 		}
+	case <-c.chDeadCh:
+		// The broker closed the channel on a channel-level exception; the
+		// connection is fine, so re-establish immediately rather than waiting
+		// out the retry delay.
+		//
+		// A connection loss signals both this and a reconnect, so one of the two
+		// can be left over and read once the channel has already been replaced.
+		// That costs nothing here: this function only runs when the loop needs a
+		// channel to consume on, and every arm ends in the same setup.
 	case <-time.After(c.retryDelay):
-		// No reconnect signal is coming if the connection is healthy but the
-		// queue is gone — retry setup on a timer so the loop never blocks
-		// forever.
+		// No signal is coming if the connection is healthy and the channel is
+		// still open but unusable — the queue was deleted, say — so retry setup
+		// on a timer too, and the loop never blocks forever.
 	}
 	if err := c.setupChannel(); err != nil {
 		c.log.Errorf("consumer: failed to re-establish channel: %v", err)
@@ -570,7 +598,8 @@ func (c *Consumer) forwardDeliveries(ctx context.Context, outCh chan<- *Delivery
 
 // Consume starts consuming and calls handler for each message.
 // The handler is automatically wrapped with any configured middleware.
-// Consumption automatically resumes after connection recovery.
+// Consumption automatically resumes after connection recovery, and after the
+// broker closes the channel on a channel-level exception.
 // If Concurrency > 1, multiple goroutines process messages in parallel.
 func (c *Consumer) Consume(ctx context.Context, handler MessageHandler) error {
 	// Apply middleware
@@ -1173,9 +1202,11 @@ func declareExchange(ch *Channel, ec ExchangeConfig) error {
 // DeclareExchange declares an exchange on the consumer's channel.
 //
 // A failed declaration (for example a type mismatch with an existing exchange)
-// closes the underlying channel, taking any in-flight consumption with it, so
-// prefer WithExchangeConfig — it declares the exchange on every channel setup
-// and so also survives reconnects.
+// closes the underlying channel, taking any in-flight consumption with it. A
+// running consume loop re-establishes the channel, but the exchange declared
+// here is not re-applied — so prefer WithExchangeConfig, which declares the
+// exchange on every channel setup and so survives both a channel-level
+// exception and a reconnect.
 func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
 	c.mu.RLock()
 	ch := c.channel

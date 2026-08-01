@@ -2957,3 +2957,176 @@ func declareExchangeRaw(t *testing.T, conn *Connection, exchange string, kind Ex
 		t.Fatalf("declare %s exchange: %v", kind, err)
 	}
 }
+
+// --- Channel-level recovery ---
+
+// TestIntegration_PublisherRecoversFromChannelException verifies that a
+// publisher recovers when the broker closes its channel on a channel-level
+// exception, without any connection loss. Publishing to a missing exchange
+// answers 404 asynchronously and kills the channel; before the close watcher
+// existed, every later publish failed with 504 for the process lifetime.
+func TestIntegration_PublisherRecoversFromChannelException(t *testing.T) {
+	conn := integrationConn(t)
+	exchange := uniqueQueue(t) + ".ex"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test").
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the exception: %v", err)
+	}
+
+	conn.mu.RLock()
+	before := conn.conn
+	conn.mu.RUnlock()
+
+	// Publishing to a missing exchange is a channel-level exception. The 404
+	// arrives asynchronously, so this publish itself usually succeeds.
+	_ = pub.PublishToExchange(ctx, exchange+".does-not-exist", "evt.test", NewTextMessage("boom"))
+
+	// The connection is untouched, so nothing but the channel watcher can
+	// restore publishing.
+	if !conn.IsHealthy() {
+		t.Fatal("connection should still be healthy after a channel-level exception")
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		err := pub.Publish(ctx, NewTextMessage("after"))
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher never recovered its channel: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Same underlying connection: recovery came from the channel watcher, not
+	// from a reconnect. IsHealthy alone would also pass after a reconnect.
+	conn.mu.RLock()
+	after := conn.conn
+	conn.mu.RUnlock()
+	if before != after {
+		t.Error("connection was reconnected; the channel watcher should have recovered the channel on the live connection")
+	}
+}
+
+// TestIntegration_PublisherIgnoresStaleChannelDeathSignal verifies that a
+// leftover channel-death signal does not tear down a healthy channel.
+//
+// A connection loss signals both a reconnect and a channel death, and whichever
+// arm handleReconnect runs first re-establishes the channel — leaving the other
+// signal buffered and now referring to a channel that is already gone. Acting on
+// it would close the channel just established, failing any confirm in flight on
+// it. The leftover signal is reproduced directly here, since which arm wins the
+// race is not something a test can pin down.
+func TestIntegration_PublisherIgnoresStaleChannelDeathSignal(t *testing.T) {
+	conn := integrationConn(t)
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pub.mu.RLock()
+	before := pub.channel
+	pub.mu.RUnlock()
+
+	pub.chDeadCh <- struct{}{}
+
+	// Long enough for handleReconnect to wake, act on the signal, and finish a
+	// channel setup if it wrongly started one.
+	time.Sleep(2 * time.Second)
+
+	pub.mu.RLock()
+	after := pub.channel
+	pub.mu.RUnlock()
+	if before != after {
+		t.Error("a stale channel-death signal replaced a healthy channel")
+	}
+
+	if err := pub.PublishToExchange(ctx, "", uniqueQueue(t), NewTextMessage("after")); err != nil {
+		t.Fatalf("publish after the stale signal: %v", err)
+	}
+}
+
+// TestIntegration_ConsumerRecoversFromChannelException verifies that a consumer
+// whose channel is killed by a channel-level exception resumes promptly, driven
+// by the close watcher rather than the retry timer: the retry delay is set far
+// beyond the test's own deadline, so only the watcher can restore consumption.
+func TestIntegration_ConsumerRecoversFromChannelException(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
+
+	// Only the channel-death signal can drive recovery within the test window.
+	consumer.mu.Lock()
+	consumer.retryDelay = 10 * time.Minute
+	consumer.mu.Unlock()
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.PublishToExchange(ctx, "", queue, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before the exception: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	conn.mu.RLock()
+	before := conn.conn
+	conn.mu.RUnlock()
+
+	// Bind to a missing exchange: NOT_FOUND kills the consumer's channel, and
+	// with it the consumption running on that channel.
+	if err := consumer.BindQueue(queue, queue+".no-such-exchange", "k", nil); err == nil {
+		t.Fatal("expected binding to a missing exchange to fail")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection should still be healthy after a channel-level exception")
+	}
+
+	publishUntilDelivered(t, ctx, pub, deliveryCh, "", queue, "after")
+
+	// Same underlying connection: recovery came from the channel watcher, not
+	// from a reconnect. IsHealthy alone would also pass after a reconnect.
+	conn.mu.RLock()
+	after := conn.conn
+	conn.mu.RUnlock()
+	if before != after {
+		t.Error("connection was reconnected; the channel watcher should have recovered the channel on the live connection")
+	}
+}

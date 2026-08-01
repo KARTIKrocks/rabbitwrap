@@ -121,6 +121,10 @@ type Publisher struct {
 	log         Logger
 	onReturn    func(Return)
 	onReturnMu  sync.RWMutex
+	// chDeadCh carries "the current channel died" from the per-channel close
+	// watcher to handleReconnect. Buffered and signalled non-blockingly, so
+	// repeated deaths coalesce into one pending re-establishment.
+	chDeadCh chan struct{}
 	// setupRetryDelay is how long handleReconnect waits before retrying a
 	// failed channel setup; set before NewPublisher returns (see
 	// defaultPublisherSetupRetryDelay).
@@ -147,6 +151,7 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 		config:          config,
 		reconnectCh:     conn.subscribeReconnect(),
 		log:             conn.log,
+		chDeadCh:        make(chan struct{}, 1),
 		setupRetryDelay: defaultPublisherSetupRetryDelay,
 	}
 
@@ -195,15 +200,39 @@ func (p *Publisher) setupChannel() error {
 		_ = ch.Close()
 		return ErrShuttingDown
 	}
+	old := p.channel
 	p.channel = ch
 	p.mu.Unlock()
+
+	// Close the channel being replaced. After a connection loss it is already
+	// dead, but a channel replaced on a live connection (see watchChannelClose)
+	// would otherwise stay open and leak.
+	if old != nil {
+		_ = old.Close()
+	}
 
 	// Start a single return listener for this channel. It dispatches to the
 	// current handler (set via NotifyReturn), so NotifyReturn never has to spawn
 	// its own listener and handlers cannot stack.
 	p.startReturnListener(ch)
+	watchChannelClose(ch, p.log, "publisher", p.isCurrentChannel, p.chDeadCh)
 
 	return nil
+}
+
+// isCurrentChannel reports whether ch is the channel the publisher is still
+// using. It is the currency test for the channel-close watcher.
+func (p *Publisher) isCurrentChannel(ch *Channel) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.channel == ch && !p.closed
+}
+
+// channelDead reports whether the publisher has no usable channel.
+func (p *Publisher) channelDead() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.channel == nil || p.channel.ch.IsClosed()
 }
 
 // startReturnListener starts the per-channel goroutine that forwards the
@@ -237,14 +266,16 @@ func (p *Publisher) NotifyReturn(handler func(Return)) {
 	p.onReturnMu.Unlock()
 }
 
-// handleReconnect re-establishes the publisher channel after connection
-// recovery, retrying on a timer when setup fails.
+// handleReconnect owns the publisher's channel lifecycle. It re-establishes the
+// channel after connection recovery, after the broker closes it with a
+// channel-level exception (see watchChannelClose), and on a timer when setup
+// itself fails.
 //
-// Setup can fail even though the connection is healthy — a configured exchange
-// may not be declarable yet — and no further reconnect signal is coming in that
-// case, so a single failed attempt would otherwise leave the publisher without
-// a usable channel until the next connection loss. The publisher only publishes
-// on a channel that completed setup.
+// Both of the latter happen while the connection is perfectly healthy, and
+// neither produces a reconnect signal, so waiting only on reconnects would
+// leave the publisher with an unusable channel until the next connection loss.
+// Serialising all three in one goroutine keeps a single setup in flight at a
+// time; the publisher only publishes on a channel that completed setup.
 func (p *Publisher) handleReconnect() {
 	// A nil channel blocks forever, so retry only fires while one is pending.
 	var retry <-chan time.Time
@@ -252,14 +283,26 @@ func (p *Publisher) handleReconnect() {
 	for {
 		// Which arm woke us decides how this attempt is reported: the timer
 		// only fires after a previous setup failed.
-		retrying := false
+		var reason string
 		select {
 		case _, ok := <-p.reconnectCh:
 			if !ok {
 				return
 			}
+			reason = "re-establishing channel after reconnect"
+		case <-p.chDeadCh:
+			// The signal can be stale: a connection loss kills the channel and
+			// triggers a reconnect, so both arms are signalled and whichever
+			// runs first already replaces the channel. Acting on the signal
+			// alone would then close a healthy, freshly established channel —
+			// interrupting any confirm in flight on it — so the state of the
+			// current channel decides, not the signal.
+			if !p.channelDead() {
+				continue // leaves any pending retry armed
+			}
+			reason = "re-establishing channel after it was closed by the broker"
 		case <-retry:
-			retrying = true
+			reason = "retrying channel setup after a failed attempt"
 		}
 		retry = nil
 
@@ -270,11 +313,7 @@ func (p *Publisher) handleReconnect() {
 			return
 		}
 
-		if retrying {
-			p.log.Infof("publisher: retrying channel setup after a failed attempt")
-		} else {
-			p.log.Infof("publisher: re-establishing channel after reconnect")
-		}
+		p.log.Infof("publisher: %s", reason)
 		if err := p.setupChannel(); err != nil {
 			if errors.Is(err, ErrShuttingDown) {
 				return
@@ -513,9 +552,10 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 // DeclareExchange declares an exchange on the publisher's channel.
 //
 // A failed declaration (for example a type mismatch with an existing exchange)
-// closes the underlying channel, and the publisher only re-establishes it on
-// connection recovery — so prefer WithExchangeConfig, which declares the
-// exchange on every channel setup.
+// closes the underlying channel. The publisher re-establishes it, but the
+// exchange declared here is not re-applied — so prefer WithExchangeConfig,
+// which declares the exchange on every channel setup and so survives both a
+// channel-level exception and a reconnect.
 func (p *Publisher) DeclareExchange(name string, kind ExchangeType, durable, autoDelete bool, args map[string]any) error {
 	p.mu.RLock()
 	ch := p.channel
