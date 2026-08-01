@@ -60,6 +60,11 @@ type ConsumerConfig struct {
 	// Middleware is applied to the message handler in order.
 	Middleware []Middleware
 
+	// Exchanges are declared on every channel setup, initially and after each
+	// reconnect, before the queue and its bindings. Set them with
+	// WithExchangeConfig.
+	Exchanges []ExchangeConfig
+
 	// QueueConfig, when set, is declared on every channel setup — initially
 	// and after each reconnect — before consuming, so the queue and its
 	// arguments survive connection loss. Its Name takes precedence over Queue.
@@ -166,11 +171,31 @@ func (c ConsumerConfig) WithQueueConfig(qc QueueConfig) ConsumerConfig {
 	return c
 }
 
+// WithExchangeConfig returns a new config that declares the given exchange on
+// every channel setup — initially and after each reconnect — before the queue
+// and its bindings. Call it multiple times to declare several exchanges.
+//
+// Use it whenever this consumer binds to an exchange it does not own: binding
+// to an exchange that does not exist yet fails with NOT_FOUND and closes the
+// channel, so a consumer that starts before the exchange's owner would
+// otherwise fail on cold start. Declaring is idempotent, so both sides can
+// declare the same exchange — as long as they agree on its type and flags,
+// since a mismatch fails with PRECONDITION_FAILED.
+func (c ConsumerConfig) WithExchangeConfig(ec ExchangeConfig) ConsumerConfig {
+	// Copy before appending so config copies never share a backing array.
+	exchanges := make([]ExchangeConfig, len(c.Exchanges), len(c.Exchanges)+1)
+	copy(exchanges, c.Exchanges)
+	exchanges = append(exchanges, ec)
+	c.Exchanges = exchanges
+	return c
+}
+
 // WithBinding returns a new config that binds the consumed queue to the given
 // exchange on every channel setup — initially and after each reconnect. Call
 // it multiple times to add several bindings. The exchange must exist when the
-// consumer is created, and so must the queue if this consumer does not declare
-// it (a non-empty queue name without WithQueueConfig).
+// consumer is created — declare it with WithExchangeConfig if this consumer
+// may start before its owner — and so must the queue if this consumer does not
+// declare it (a non-empty queue name without WithQueueConfig).
 func (c ConsumerConfig) WithBinding(exchange, routingKey string, args map[string]any) ConsumerConfig {
 	// Copy before appending so config copies never share a backing array.
 	bindings := make([]BindingConfig, len(c.Bindings), len(c.Bindings)+1)
@@ -262,6 +287,10 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 		return nil, fmt.Errorf("%w: WithDeadLetterQueue requires a named work queue", ErrInvalidConfig)
 	}
 
+	if err := validateExchanges(config.Exchanges); err != nil {
+		return nil, err
+	}
+
 	c := &Consumer{
 		conn:        conn,
 		config:      config,
@@ -324,10 +353,18 @@ func (c *Consumer) setupChannel() error {
 	return nil
 }
 
-// applyTopology declares the configured queue and applies the configured
-// bindings on the given channel, returning the resolved queue name.
+// applyTopology declares the configured exchanges and queue and applies the
+// configured bindings on the given channel, returning the resolved queue name.
 func (c *Consumer) applyTopology(ch *Channel) (string, error) {
-	// Declare the dead-letter topology first so the work queue's
+	// Declare the configured exchanges first: binding to a missing exchange
+	// fails with NOT_FOUND and closes the channel.
+	for _, ec := range c.config.Exchanges {
+		if err := declareExchange(ch, ec); err != nil {
+			return "", fmt.Errorf("declare exchange %q: %w", ec.Name, err)
+		}
+	}
+
+	// Declare the dead-letter topology next so the work queue's
 	// x-dead-letter-exchange target exists before the work queue is declared.
 	if err := c.applyDeadLetter(ch); err != nil {
 		return "", err
@@ -652,7 +689,13 @@ func (c *Consumer) DeclareQueue(name string, durable, autoDelete, exclusive bool
 	}, nil
 }
 
-// BindQueue binds a queue to an exchange.
+// BindQueue binds a queue to an exchange on the consumer's channel.
+//
+// Binding to an exchange that does not exist fails with NOT_FOUND, and the
+// broker closes the underlying channel — so a failed bind also interrupts
+// consumption, and the binding is not retried. Prefer WithExchangeConfig plus
+// WithBinding, which declare the exchange and apply the binding on every
+// channel setup and therefore also survive reconnects.
 func (c *Consumer) BindQueue(queue, exchange, routingKey string, args map[string]any) error {
 	c.mu.RLock()
 	ch := c.channel
@@ -1049,7 +1092,8 @@ type ExchangeConfig struct {
 	// Name is the exchange name.
 	Name string
 
-	// Type is the exchange type.
+	// Type is the exchange type. An empty value declares a direct exchange,
+	// the AMQP default type.
 	Type ExchangeType
 
 	// Durable makes the exchange survive broker restarts.
@@ -1095,7 +1139,43 @@ func (c ExchangeConfig) WithInternal(internal bool) ExchangeConfig {
 	return c
 }
 
-// DeclareExchange declares an exchange.
+// validateExchanges rejects declarative exchange configs that would fail at
+// the broker in a way that closes the channel. An empty name is the default
+// exchange, which cannot be declared (ACCESS_REFUSED).
+func validateExchanges(exchanges []ExchangeConfig) error {
+	for _, ec := range exchanges {
+		if ec.Name == "" {
+			return fmt.Errorf("%w: exchange name must not be empty", ErrInvalidConfig)
+		}
+	}
+	return nil
+}
+
+// declareExchange declares one configured exchange on the given channel,
+// defaulting an unset type to direct (the AMQP default type). It backs both the
+// declarative topology (consumer and publisher) and DeclareExchange.
+func declareExchange(ch *Channel, ec ExchangeConfig) error {
+	kind := ec.Type
+	if kind == "" {
+		kind = ExchangeDirect
+	}
+	return ch.ch.ExchangeDeclare(
+		ec.Name,
+		string(kind),
+		ec.Durable,
+		ec.AutoDelete,
+		ec.Internal,
+		false, // no-wait
+		amqp.Table(ec.Args),
+	)
+}
+
+// DeclareExchange declares an exchange on the consumer's channel.
+//
+// A failed declaration (for example a type mismatch with an existing exchange)
+// closes the underlying channel, taking any in-flight consumption with it, so
+// prefer WithExchangeConfig — it declares the exchange on every channel setup
+// and so also survives reconnects.
 func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
 	c.mu.RLock()
 	ch := c.channel
@@ -1103,15 +1183,7 @@ func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
 	if ch == nil {
 		return ErrChannelClosed
 	}
-	return ch.ch.ExchangeDeclare(
-		config.Name,
-		string(config.Type),
-		config.Durable,
-		config.AutoDelete,
-		config.Internal,
-		false, // no-wait
-		amqp.Table(config.Args),
-	)
+	return declareExchange(ch, config)
 }
 
 // DeleteExchange deletes an exchange.

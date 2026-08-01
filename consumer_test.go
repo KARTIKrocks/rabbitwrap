@@ -542,3 +542,96 @@ func TestNewConsumer_DeadLetterRequiresNamedQueue(t *testing.T) {
 		t.Errorf("expected ErrInvalidConfig for anonymous work queue, got %v", err)
 	}
 }
+
+func TestConsumerConfigWithExchangeConfig(t *testing.T) {
+	c := DefaultConsumerConfig().
+		WithQueue("q").
+		WithExchangeConfig(DefaultExchangeConfig("ex-1", ExchangeTopic)).
+		WithExchangeConfig(DefaultExchangeConfig("ex-2", ExchangeFanout).WithDurable(false))
+
+	if len(c.Exchanges) != 2 {
+		t.Fatalf("expected 2 exchanges, got %d", len(c.Exchanges))
+	}
+	if c.Exchanges[0].Name != "ex-1" || c.Exchanges[0].Type != ExchangeTopic {
+		t.Errorf("unexpected first exchange: %+v", c.Exchanges[0])
+	}
+	if !c.Exchanges[0].Durable {
+		t.Errorf("expected first exchange to be durable: %+v", c.Exchanges[0])
+	}
+	if c.Exchanges[1].Name != "ex-2" || c.Exchanges[1].Type != ExchangeFanout {
+		t.Errorf("unexpected second exchange: %+v", c.Exchanges[1])
+	}
+	if c.Exchanges[1].Durable {
+		t.Errorf("expected second exchange to be non-durable: %+v", c.Exchanges[1])
+	}
+}
+
+func TestConsumerConfigWithExchangeConfigCopySemantics(t *testing.T) {
+	base := DefaultConsumerConfig().WithQueue("q").
+		WithExchangeConfig(DefaultExchangeConfig("base", ExchangeTopic))
+
+	// Two configs diverging from the same base must not share exchanges.
+	a := base.WithExchangeConfig(DefaultExchangeConfig("a", ExchangeTopic))
+	b := base.WithExchangeConfig(DefaultExchangeConfig("b", ExchangeTopic))
+
+	if len(base.Exchanges) != 1 {
+		t.Errorf("base mutated: expected 1 exchange, got %d", len(base.Exchanges))
+	}
+	if a.Exchanges[1].Name != "a" {
+		t.Errorf("expected a's second exchange to be a, got %s", a.Exchanges[1].Name)
+	}
+	if b.Exchanges[1].Name != "b" {
+		t.Errorf("expected b's second exchange to be b, got %s", b.Exchanges[1].Name)
+	}
+}
+
+func TestPublisherConfigWithExchangeConfig(t *testing.T) {
+	base := DefaultPublisherConfig().WithExchange("target").
+		WithExchangeConfig(DefaultExchangeConfig("base", ExchangeTopic))
+
+	// WithExchange names the publish target; WithExchangeConfig declares.
+	if base.Exchange != "target" {
+		t.Errorf("Exchange = %q, want target", base.Exchange)
+	}
+
+	a := base.WithExchangeConfig(DefaultExchangeConfig("a", ExchangeTopic))
+	b := base.WithExchangeConfig(DefaultExchangeConfig("b", ExchangeTopic))
+
+	if len(base.Exchanges) != 1 {
+		t.Errorf("base mutated: expected 1 exchange, got %d", len(base.Exchanges))
+	}
+	if a.Exchanges[1].Name != "a" || b.Exchanges[1].Name != "b" {
+		t.Errorf("configs share a backing array: a=%+v b=%+v", a.Exchanges, b.Exchanges)
+	}
+}
+
+func TestValidateExchanges(t *testing.T) {
+	if err := validateExchanges(nil); err != nil {
+		t.Errorf("nil exchanges: unexpected error %v", err)
+	}
+	if err := validateExchanges([]ExchangeConfig{DefaultExchangeConfig("ex", ExchangeTopic)}); err != nil {
+		t.Errorf("valid exchange: unexpected error %v", err)
+	}
+	// The empty name is the default exchange, which cannot be declared.
+	err := validateExchanges([]ExchangeConfig{DefaultExchangeConfig("", ExchangeTopic)})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("empty exchange name: got %v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestNewConsumer_RejectsUnnamedExchange(t *testing.T) {
+	_, err := NewConsumer(&Connection{}, DefaultConsumerConfig().
+		WithQueue("q").
+		WithExchangeConfig(DefaultExchangeConfig("", ExchangeTopic)))
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for unnamed exchange, got %v", err)
+	}
+}
+
+func TestNewPublisher_RejectsUnnamedExchange(t *testing.T) {
+	_, err := NewPublisher(&Connection{}, DefaultPublisherConfig().
+		WithExchangeConfig(DefaultExchangeConfig("", ExchangeTopic)))
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for unnamed exchange, got %v", err)
+	}
+}
