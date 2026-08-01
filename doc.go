@@ -72,6 +72,23 @@
 //	    return nil // return nil to ack, error to nack
 //	})
 //
+// # Declarative topology
+//
+// Exchanges, queues, and bindings configured on a publisher or consumer are
+// declared on every channel setup — initially and after each reconnect — so the
+// topology survives connection loss and start-up ordering:
+//
+//	consumer, err := rabbitmq.NewConsumer(conn,
+//	    rabbitmq.DefaultConsumerConfig().
+//	        WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic)).
+//	        WithQueueConfig(rabbitmq.DefaultQueueConfig("my-queue")).
+//	        WithBinding("events", "user.*", nil),
+//	)
+//
+// Declaring the exchange this way is what makes a consumer safe to start before
+// the service that owns it: binding to an exchange that does not exist yet
+// fails with NOT_FOUND and the broker closes the channel.
+//
 // # Middleware
 //
 // The package includes built-in middleware for common patterns:

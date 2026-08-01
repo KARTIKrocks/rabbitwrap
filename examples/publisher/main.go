@@ -30,21 +30,19 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Create a publisher with confirms enabled (the default).
+	// Create a publisher with confirms enabled (the default). The exchange is
+	// declared as part of the publisher's configuration, so it exists before the
+	// first publish and is re-declared after every reconnect.
 	pub, err := rabbitmq.NewPublisher(conn,
 		rabbitmq.DefaultPublisherConfig().
 			WithExchange("example.direct").
-			WithRoutingKey("example.key"),
+			WithRoutingKey("example.key").
+			WithExchangeConfig(rabbitmq.DefaultExchangeConfig("example.direct", rabbitmq.ExchangeDirect)),
 	)
 	if err != nil {
 		log.Fatalf("failed to create publisher: %v", err)
 	}
 	defer pub.Close()
-
-	// Declare the exchange so it exists before publishing.
-	if err := pub.DeclareExchange("example.direct", rabbitmq.ExchangeDirect, true, false, nil); err != nil {
-		log.Fatalf("failed to declare exchange: %v", err)
-	}
 
 	// 1. Publish a plain-text message.
 	if err := pub.PublishText(ctx, "Hello from rabbitwrap!"); err != nil {

@@ -21,7 +21,7 @@ Requires Go 1.22+.
 ## Features
 
 - **Auto-reconnection** with exponential backoff for connections, publishers, and consumers
-- **Declarative consumer topology** — queues and bindings restored automatically after reconnects
+- **Declarative topology** — exchanges, queues, and bindings restored automatically after reconnects
 - **Publisher confirms** for reliable message delivery
 - **Consumer middleware** (logging, recovery, retry — or bring your own)
 - **Concurrent consumers** with configurable worker goroutines
@@ -270,6 +270,7 @@ after each reconnect:
 
 ```go
 consConfig := rabbitmq.DefaultConsumerConfig().
+    WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic)).
     WithQueueConfig(rabbitmq.DefaultQueueConfig("ws-fanout").
         WithDurable(false).
         WithAutoDelete(true).
@@ -279,10 +280,29 @@ consConfig := rabbitmq.DefaultConsumerConfig().
 consumer, err := rabbitmq.NewConsumer(conn, consConfig)
 ```
 
-After a broker restart or network blip, the queue is re-declared and re-bound
-automatically and consumption resumes. `WithBinding` also works for
+After a broker restart or network blip, the exchange and queue are re-declared,
+the queue is re-bound, and consumption resumes. `WithBinding` also works for
 server-named queues (empty queue name), which get a fresh name on each
-reconnect. The bound exchange must already exist when the consumer is created.
+reconnect.
+
+Bindings are applied in order after the exchanges, so `WithExchangeConfig` is
+what makes a consumer safe to start before whichever service owns the exchange:
+binding to an exchange that does not exist yet fails with `NOT_FOUND` **and the
+broker closes the channel**, taking consumption down with it. Without it, a
+consumer that wins the cold-start race against the exchange's owner never
+receives anything. Declaring is idempotent, so both sides can declare the same
+exchange — as long as they agree on its type and flags, since a mismatch fails
+with `PRECONDITION_FAILED`.
+
+Publishers take the same option, which is worth using whenever the publisher
+may be the first one up:
+
+```go
+pubConfig := rabbitmq.DefaultPublisherConfig().
+    WithExchange("events").      // where to publish
+    WithRoutingKey("user.created").
+    WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic))
+```
 
 ### Dead-Letter Queues
 
@@ -509,6 +529,15 @@ err = consumer.DeclareExchange(exchangeConfig)
 err = consumer.BindQueue("my-queue", "my-exchange", "routing.key", nil)
 err = consumer.UnbindQueue("my-queue", "my-exchange", "routing.key", nil)
 ```
+
+> **These imperative calls share the consumer's (or publisher's) channel.** A
+> failed declare or bind — binding to a missing exchange, declaring over an
+> exchange of a different type — is a channel-level exception: the broker closes
+> the channel, which also interrupts consumption, and the call is never retried.
+> Prefer the declarative
+> [`WithExchangeConfig`/`WithQueueConfig`/`WithBinding`](#declarative-topology-survives-reconnection)
+> options, which are applied on every channel setup and so also survive
+> reconnects.
 
 ### Delete/Purge
 

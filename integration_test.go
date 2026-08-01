@@ -2606,3 +2606,217 @@ func TestIntegration_BackoffRetryExhaustedDeadLetters(t *testing.T) {
 		t.Errorf("handler ran %d times, want 2 (initial + 1 retry)", n)
 	}
 }
+
+// --- Declarative exchange declaration ---
+
+// TestIntegration_DeclarativeExchangeColdStart verifies that a consumer can
+// bind to an exchange it declares itself, even when nothing has declared that
+// exchange yet. Without WithExchangeConfig the bind fails with NOT_FOUND and
+// closes the channel, which is the cold-start ordering hazard when services
+// start in parallel.
+func TestIntegration_DeclarativeExchangeColdStart(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	// Deliberately do NOT declare the exchange first: the consumer owns it.
+	cfg := DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil)
+
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer declaring its own exchange: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("cold-start")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "cold-start")
+}
+
+// TestIntegration_DeclarativeExchangeRestoredAfterReconnect verifies that a
+// consumer-declared exchange is re-declared on reconnect, before the bindings
+// that depend on it — so a consumer recovers even if the exchange disappeared
+// while the connection was down.
+func TestIntegration_DeclarativeExchangeRestoredAfterReconnect(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	cfg := DefaultConsumerConfig().
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)).
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil)
+
+	consumer, err := NewConsumer(conn, cfg)
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test"))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before reconnect: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Drop the exchange (taking its bindings with it), then force a reconnect.
+	deleteExchange(t, conn, exchange)
+	conn.mu.RLock()
+	underlying := conn.conn
+	conn.mu.RUnlock()
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	// The consumer must re-create the exchange itself; only publish once it is
+	// back, so a publish cannot hit a missing exchange and kill the channel.
+	waitForExchange(t, conn, exchange)
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+}
+
+// TestIntegration_PublisherDeclarativeExchange verifies the publisher side:
+// the exchange is declared at construction and re-declared after a reconnect.
+func TestIntegration_PublisherDeclarativeExchange(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	exchange := queue + ".ex"
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().
+		WithExchange(exchange).
+		WithRoutingKey("evt.test").
+		WithExchangeConfig(DefaultExchangeConfig(exchange, ExchangeTopic).WithDurable(false)))
+	if err != nil {
+		t.Fatalf("failed to create publisher declaring its own exchange: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	// The publisher declared it, so a consumer can bind without declaring.
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(exchange, "evt.*", nil))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+
+	if err := pub.Publish(ctx, NewTextMessage("before")); err != nil {
+		t.Fatalf("publish before reconnect: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	// Drop the exchange and force a reconnect: the publisher re-declares it as
+	// part of its channel setup.
+	deleteExchange(t, conn, exchange)
+	conn.mu.RLock()
+	underlying := conn.conn
+	conn.mu.RUnlock()
+	if err := underlying.Close(); err != nil {
+		t.Fatalf("close underlying connection: %v", err)
+	}
+
+	waitForExchange(t, conn, exchange)
+	publishUntilDelivered(t, ctx, pub, deliveryCh, exchange, "evt.test", "after")
+}
+
+// waitForExchange blocks until the exchange exists, checked with a passive
+// declare on a throwaway channel (a passive declare of a missing exchange is a
+// channel-level exception, so each attempt needs a fresh channel).
+func waitForExchange(t *testing.T, conn *Connection, exchange string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		ch, err := conn.Channel()
+		if err == nil {
+			err = ch.Raw().ExchangeDeclarePassive(exchange, string(ExchangeTopic), false, false, false, false, nil)
+			_ = ch.Close()
+			if err == nil {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("exchange %q was not re-declared", exchange)
+}
+
+// TestIntegration_BindingWithoutExchangeFails pins the hazard that
+// WithExchangeConfig exists to remove: without declaring the exchange, binding
+// to one that does not exist yet fails loudly at construction rather than
+// leaving a consumer that silently receives nothing.
+func TestIntegration_BindingWithoutExchangeFails(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).
+			WithDurable(false).
+			WithAutoDelete(true).
+			WithExclusive(true)).
+		WithBinding(queue+".missing-ex", "evt.*", nil))
+	if err == nil {
+		consumer.Close()
+		t.Fatal("expected NewConsumer to fail binding to a missing exchange")
+	}
+
+	var amqpErr *amqp.Error
+	if !errors.As(err, &amqpErr) {
+		t.Fatalf("error = %v, want an *amqp.Error", err)
+	}
+	if amqpErr.Code != amqp.NotFound {
+		t.Errorf("reply code = %d, want %d (NOT_FOUND)", amqpErr.Code, amqp.NotFound)
+	}
+}

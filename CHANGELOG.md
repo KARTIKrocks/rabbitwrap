@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-08-01
+
+### Added
+
+- **`WithExchangeConfig` — declarative exchange declaration for consumers and
+  publishers.** Configured exchanges are declared on every channel setup,
+  initially and after each reconnect, and for consumers before the queue and its
+  bindings.
+
+  ```go
+  consConfig := rabbitmq.DefaultConsumerConfig().
+      WithExchangeConfig(rabbitmq.DefaultExchangeConfig("events", rabbitmq.ExchangeTopic)).
+      WithQueueConfig(rabbitmq.DefaultQueueConfig("ws-fanout")).
+      WithBinding("events", "user.*", nil)
+  ```
+
+  This closes a cold-start hazard. `WithBinding` (and `BindQueue`) previously
+  required the exchange to already exist; binding to a missing exchange fails
+  with `NOT_FOUND`, and because that is a channel-level exception the broker
+  **closes the channel** — so a consumer that started before whichever service
+  owned the exchange could not bind, and the failure surfaced only as an error
+  at construction time or a single log line. Declaring the exchange as part of
+  the consumer's own topology removes the ordering requirement entirely, on
+  first start and on every reconnect.
+
+  Exchange declaration is idempotent, so producer and consumer may both declare
+  the same exchange, provided they agree on its type and flags (a mismatch fails
+  with `PRECONDITION_FAILED`). `NewConsumer` and `NewPublisher` reject an
+  exchange config with an empty name (`ErrInvalidConfig`) rather than attempting
+  to declare the default exchange, which the broker refuses.
+
+  On the publisher, `WithExchangeConfig` (declare this exchange) is distinct
+  from the existing `WithExchange` (publish to this exchange).
+
+### Changed
+
+- `Consumer.DeclareExchange` now defaults an unset `ExchangeConfig.Type` to
+  `ExchangeDirect`, the AMQP default type, instead of sending an empty type that
+  the broker rejects.
+- Documented on `Consumer.BindQueue`, `Consumer.DeclareExchange`, and
+  `Publisher.DeclareExchange` that these imperative calls share the channel used
+  for consuming/publishing: a failed call closes that channel and is not
+  retried. The declarative options are the recommended alternative.
+- `PublisherConfig` gained a slice field and is therefore no longer comparable
+  with `==`. Every field was comparable before, so code doing `cfgA == cfgB`
+  stops compiling; compare the fields you care about instead. `ConsumerConfig`
+  has never been comparable.
+
 ## [0.10.0] - 2026-07-28
 
 ### Added

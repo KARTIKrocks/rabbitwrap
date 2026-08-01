@@ -31,6 +31,10 @@ type PublisherConfig struct {
 
 	// ConfirmTimeout is the timeout for waiting for confirms.
 	ConfirmTimeout time.Duration
+
+	// Exchanges are declared on every channel setup, initially and after each
+	// reconnect. Set them with WithExchangeConfig.
+	Exchanges []ExchangeConfig
 }
 
 // DefaultPublisherConfig returns a default publisher configuration.
@@ -52,6 +56,25 @@ func DefaultPublisherConfig() PublisherConfig {
 // WithExchange returns a new config with the specified exchange.
 func (c PublisherConfig) WithExchange(exchange string) PublisherConfig {
 	c.Exchange = exchange
+	return c
+}
+
+// WithExchangeConfig returns a new config that declares the given exchange on
+// every channel setup — initially and after each reconnect. Call it multiple
+// times to declare several exchanges.
+//
+// Unlike WithExchange, which only names the exchange to publish to, this
+// declares it: a publisher that starts before the exchange exists creates it,
+// instead of publishing to a missing exchange — which the broker answers with
+// NOT_FOUND, closing the channel. Declaring is idempotent, so publisher and
+// consumer can both declare the same exchange — as long as they agree on its
+// type and flags, since a mismatch fails with PRECONDITION_FAILED.
+func (c PublisherConfig) WithExchangeConfig(ec ExchangeConfig) PublisherConfig {
+	// Copy before appending so config copies never share a backing array.
+	exchanges := make([]ExchangeConfig, len(c.Exchanges), len(c.Exchanges)+1)
+	copy(exchanges, c.Exchanges)
+	exchanges = append(exchanges, ec)
+	c.Exchanges = exchanges
 	return c
 }
 
@@ -106,6 +129,10 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 		return nil, ErrNilConnection
 	}
 
+	if err := validateExchanges(config.Exchanges); err != nil {
+		return nil, err
+	}
+
 	p := &Publisher{
 		conn:        conn,
 		config:      config,
@@ -123,7 +150,9 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 	return p, nil
 }
 
-// setupChannel creates a new channel and enables confirm mode if configured.
+// setupChannel creates a new channel, enables confirm mode if configured, and
+// declares the configured exchanges. It runs on initial setup and after every
+// reconnect.
 func (p *Publisher) setupChannel() error {
 	ch, err := p.conn.Channel()
 	if err != nil {
@@ -140,6 +169,14 @@ func (p *Publisher) setupChannel() error {
 			return fmt.Errorf("failed to enable confirm mode: %w", err)
 		}
 	}
+
+	for _, ec := range p.config.Exchanges {
+		if err := declareExchange(ch, ec); err != nil {
+			_ = ch.Close()
+			return fmt.Errorf("declare exchange %q: %w", ec.Name, err)
+		}
+	}
+
 	p.mu.Lock()
 	p.channel = ch
 	p.mu.Unlock()
@@ -425,7 +462,12 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 	return nil
 }
 
-// DeclareExchange declares an exchange.
+// DeclareExchange declares an exchange on the publisher's channel.
+//
+// A failed declaration (for example a type mismatch with an existing exchange)
+// closes the underlying channel, and the publisher only re-establishes it on
+// connection recovery — so prefer WithExchangeConfig, which declares the
+// exchange on every channel setup.
 func (p *Publisher) DeclareExchange(name string, kind ExchangeType, durable, autoDelete bool, args map[string]any) error {
 	p.mu.RLock()
 	ch := p.channel
