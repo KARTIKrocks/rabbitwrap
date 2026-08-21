@@ -1,0 +1,25 @@
+{
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "description": "Repository conventions: build/test/lint commands, integration-test setup (build tag, docker-compose, RabbitMQ 4), backward-compatibility and godoc requirements."
+    },
+    {
+      "path": "doc.go",
+      "description": "Package-level overview: connection/publisher/consumer usage, declarative topology and its re-declaration behavior, middleware."
+    },
+    {
+      "path": "rabbitmq.go",
+      "description": "Sentinel errors (ErrConnectionClosed, ErrNack, ErrRequeue, ErrDrop, ...) and Connection's reconnection/backoff logic that every other file builds on.",
+      "scope": ["consumer.go", "publisher.go", "middleware.go", "message.go"]
+    },
+    {
+      "path": "CHANGELOG.md",
+      "description": "Keep-a-Changelog history, including detailed incident write-ups for two real concurrency bugs (0.13.0 topology loss, 0.14.0 Close/Start race) that motivate several review rules — see .greptile/rules.md."
+    },
+    {
+      "path": ".golangci.yml",
+      "description": "The linter ruleset already enforced in CI; note revive's 'exported' check is deliberately disabled here, so godoc-on-export is not caught by lint."
+    }
+  ]
+}
