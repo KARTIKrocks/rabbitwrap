@@ -713,9 +713,9 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Register the loop before starting it, so a Stop or Close that follows
-	// cannot miss it.
+	// cannot miss it, and drop the handles whose loops have already finished.
 	done := make(chan struct{})
-	c.loops = append(c.loops, consumeLoopHandle{cancel: cancel, done: done})
+	c.loops = append(runningLoops(c.loops), consumeLoopHandle{cancel: cancel, done: done})
 
 	go func() {
 		defer close(done)
@@ -737,13 +737,32 @@ type consumeLoopHandle struct {
 // stopConsumeLoops cancels every running consume loop and returns their
 // handles, so the caller can wait for them after releasing the lock — which it
 // must, since the loops take c.mu themselves. Callers must hold c.mu.
+//
+// The handles stay in c.loops rather than being handed to the caller
+// exclusively: a Stop and a Close racing each other must both wait for the same
+// loops, and whichever arrived second would otherwise be given nothing to wait
+// for and close the channel out from under a loop still using it. Start prunes
+// the handles whose loops have since returned.
 func (c *Consumer) stopConsumeLoops() []consumeLoopHandle {
-	loops := c.loops
-	c.loops = nil
-	for _, l := range loops {
+	for _, l := range c.loops {
 		l.cancel()
 	}
-	return loops
+	return c.loops
+}
+
+// runningLoops returns the handles whose loops have not returned yet, in a new
+// slice: the one passed in may still be being read by a Stop or Close waiting
+// on an earlier snapshot, so it must not be filtered in place.
+func runningLoops(loops []consumeLoopHandle) []consumeLoopHandle {
+	var running []consumeLoopHandle
+	for _, l := range loops {
+		select {
+		case <-l.done:
+		default:
+			running = append(running, l)
+		}
+	}
+	return running
 }
 
 // defaultConsumeRetryDelay is the default for Consumer.retryDelay: how long the

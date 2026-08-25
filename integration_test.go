@@ -1444,6 +1444,61 @@ func TestIntegration_ConsumerStopThenStart(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
+// TestIntegration_ConsumerStopAndCloseConcurrently races Stop against Close on
+// the same consumer, which a shutdown path that stops consumers and closes them
+// from different goroutines will do.
+//
+// Both have to wait for the same consume loops. Handing the loops to whichever
+// arrived first would leave the other waiting for nothing and closing the
+// channel while a request was still outstanding on it — the hazard
+// TestIntegration_ConsumerCloseImmediatelyAfterStart describes, reached by a
+// different route. Before the fix this reproduced within a handful of
+// iterations, with a 503 and both waits timing out.
+func TestIntegration_ConsumerStopAndCloseConcurrently(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during concurrent Stop/Close: %v", err)
+	})
+
+	for i := range 30 {
+		// A server-named queue declares nothing, so no topology refresh runs and
+		// the consume loop is the only thing the two calls wait for.
+		consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := consumer.Start(ctx); err != nil {
+			cancel()
+			consumer.Close()
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// No delay: the basic.consume is still in flight, which is the point.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		began := time.Now()
+		go func() { defer wg.Done(); consumer.Stop() }()
+		go func() {
+			defer wg.Done()
+			if err := consumer.Close(); err != nil {
+				t.Errorf("iteration %d: close: %v", i, err)
+			}
+		}()
+		wg.Wait()
+		if took := time.Since(began); took > 2*time.Second {
+			t.Fatalf("iteration %d: Stop and Close took %s, expected neither to wait out a timeout", i, took)
+		}
+		cancel()
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the concurrent Stop/Close cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
 // assertRoundTrip publishes a message on conn and requires a consumer on the
 // same connection to receive it, proving the connection is still fully usable.
 func assertRoundTrip(t *testing.T, conn *Connection) {

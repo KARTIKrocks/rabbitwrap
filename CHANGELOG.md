@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.14.0] - 2026-08-01
+## [0.14.0] - 2026-08-25
 
 ### Fixed
 
@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Close` now waits for the consume loops to return before closing the channel,
   and a cancelled loop no longer issues a `basic.consume` it is about to
   abandon. The same 60 cycles complete in about a second.
+
+  A `Stop` and a `Close` running concurrently on the same consumer — a shutdown
+  path that stops consumers and closes them from different goroutines — reach
+  the same hazard by another route, and now both wait for the same loops rather
+  than the second one being left with nothing to wait for.
 
   Only a `Close` racing its own `Start` was affected — a gap of a millisecond
   was enough to avoid it — so consumers that run for any length of time were
