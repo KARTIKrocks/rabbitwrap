@@ -1,0 +1,4 @@
+{
+  "disabledRules": ["go-exported-docs", "error-wrapping"],
+  "instructions": "Example code prioritizes clarity for readers over library-internal rigor (the repo's own .golangci.yml excludes examples/ entirely). Relax the disabled rules above, but still flag misuse of the library API, unclosed connections/channels, or a durable/exclusive queue mistake that would mislead a reader copying the code."
+}

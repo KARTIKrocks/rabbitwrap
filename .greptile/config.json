@@ -1,0 +1,58 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax", "style"],
+  "triggerOnUpdates": true,
+  "statusCheck": true,
+  "ignorePatterns": "**/*.sum\n**/go.work.sum\n**/coverage.out\n**/coverage.html\n**/testdata/**\n**/node_modules/**",
+  "instructions": "rabbitwrap (module github.com/KARTIKrocks/rabbitwrap, package name rabbitmq) is a public Go wrapper around github.com/rabbitmq/amqp091-go: connection management with automatic reconnection, publisher confirms, consumer management with prefetch/manual ack, declarative topology with periodic re-declaration, middleware, and dead-letter support. CI runs with -race; concurrency correctness and AMQP protocol semantics matter more here than style. Two real incidents (see CHANGELOG.md 0.13.0 and 0.14.0) already shaped several of the rules below — see .greptile/rules.md for the worked examples before assuming a 'no error returned' code path is actually safe.",
+  "rules": [
+    {
+      "id": "ack-exactly-once",
+      "rule": "A Delivery must be settled — Ack, Nack, or Reject — exactly once. Do not suggest changes to processDelivery, Consume, or a custom handler that could call more than one of these on the same delivery, or leave a code path where none of them is called (including on panic or early return). ErrRequeue and ErrDrop from a handler override ConsumerConfig.RequeueOnError and must be detected with errors.Is even when wrapped with %w.",
+      "scope": ["consumer.go", "message.go"],
+      "severity": "high"
+    },
+    {
+      "id": "channel-rpc-concurrency",
+      "rule": "amqp091-go does not serialize concurrent synchronous RPCs on one *amqp.Channel (e.g. basic.consume and channel.close both waiting on the same internal rpc slot) — either can be handed the other's reply, and the loser hangs until the connection dies, permanently leaking that channel id. Flag any new code path that could issue a synchronous channel call (Consume, QueueDeclare, ExchangeDeclare, Confirm, Close, ...) concurrently with another synchronous call on the same *Channel/*Connection without a happens-before relationship established by waiting on a goroutine/channel first.",
+      "scope": ["consumer.go", "publisher.go", "rabbitmq.go"],
+      "severity": "high"
+    },
+    {
+      "id": "topology-recovery-blind-spot",
+      "rule": "Deleting an exchange or binding destroys routing but leaves the consumer's channel, queue, and consume tag entirely valid — no error, no basic.cancel, no channel close is ever raised. Any reconnect/recovery logic must not assume 'no error means topology intact'; the only way to detect or fix this class of silent breakage is periodic re-declaration (see WithTopologyRefresh / startTopologyRefresh). Do not suggest removing or relying solely on error-triggered recovery for topology that a consumer itself declares.",
+      "scope": ["consumer.go", "publisher.go"],
+      "severity": "high"
+    },
+    {
+      "id": "shutdown-must-wait-not-signal",
+      "rule": "Close/Stop must wait for spawned goroutines (consume loops, topology refresh loop, return listener) to actually return before closing the channel/connection they depend on, not merely signal them to stop and return immediately. A Close that races a Start/loop still touching the same channel is what caused the 0.14.0 connection-exhaustion bug (see .greptile/rules.md). Every new goroutine needs a visible, awaited termination path.",
+      "scope": ["**/*.go"],
+      "severity": "high"
+    },
+    {
+      "id": "confirm-mode-blocking",
+      "rule": "PublisherConfig.ConfirmMode defaults to false because it makes every Publish block on a broker round-trip. Any change to the confirm-mode publish path must keep respecting both the caller's ctx and ConfirmTimeout so a publish cannot block forever if the broker never confirms, and must not silently change the default to blocking behavior.",
+      "scope": ["publisher.go"],
+      "severity": "medium"
+    },
+    {
+      "id": "durable-or-exclusive-queues",
+      "rule": "RabbitMQ 4 (the version pinned in docker-compose.yml and CI) rejects transient, non-exclusive queue declarations outright (541 INTERNAL_ERROR). Any new or changed QueueConfig/DeclareQueue default or example must declare queues that are durable or exclusive, never both durable=false and exclusive=false.",
+      "scope": ["consumer.go", "rabbitmq.go"],
+      "severity": "medium"
+    },
+    {
+      "id": "error-wrapping",
+      "rule": "An error from amqp091-go or an internal call must be wrapped with %w (or returned as one of the rabbitmq sentinel errors) before propagating, never silently discarded with `_`. Sentinel errors defined in rabbitmq.go (ErrConnectionClosed, ErrChannelClosed, ErrNack, ErrRequeue, ErrDrop, ...) must stay comparable via errors.Is even after wrapping.",
+      "scope": ["**/*.go"],
+      "severity": "medium"
+    },
+    {
+      "id": "go-exported-docs",
+      "rule": "Every new or newly-exported type, function, method, and constant must have a godoc comment starting with the identifier's own name — adding an export is a minor version bump per AGENTS.md and needs documentation to match. Note revive's 'exported' rule is deliberately disabled in .golangci.yml, so lint will not catch a missing one; this is the only enforcement.",
+      "scope": ["**/*.go"],
+      "severity": "low"
+    }
+  ]
+}
