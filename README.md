@@ -446,9 +446,10 @@ come back to.
 By default each `Start` names its own subscription, which is what makes it
 cancellable: the broker will name one itself, but that name is never given back
 to the client. Set `WithConsumerTag` to choose the name shown in the management
-UI. A chosen name stays registered on the channel until it is cancelled, so if a
-cancel could not be sent the next `Start` returns `ErrConsumerTagInUse` rather
-than let the broker answer with a connection-level `530 NOT_ALLOWED`.
+UI. A chosen name stays registered on the channel until it is cancelled. If a cancel
+could not be sent, the next `Start` retries it, and only returns
+`ErrConsumerTagInUse` if that fails too — rather than let the broker answer with
+a connection-level `530 NOT_ALLOWED`.
 
 ### Manual Message Handling
 

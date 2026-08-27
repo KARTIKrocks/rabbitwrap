@@ -42,10 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what auto-delete means — the missing cancel was hiding it. Use a
   durable queue for anything a stopped consumer should come back to.
 
-- **`Start` returns the new `ErrConsumerTagInUse`** when a configured tag is
-  still registered because its cancel could not be sent, rather than letting the
-  broker answer with the connection-level 530 described above. It clears once
-  the channel is re-established, since registrations live on the channel.
+- **`Start` retries an outstanding cancel, and returns the new
+  `ErrConsumerTagInUse`** if even that cannot get through — rather than letting
+  the broker answer with the connection-level 530 described above. The retry
+  matters because nothing else re-establishes a consumer's channel: that is the
+  consume loop's job, and the case this arises in is precisely the one with no
+  loop running, so a single failed cancel would otherwise refuse every `Start`
+  for the rest of the consumer's life.
 
 ## [0.14.0] - 2026-08-25
 

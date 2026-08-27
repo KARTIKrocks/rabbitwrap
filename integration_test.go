@@ -2019,13 +2019,71 @@ func TestIntegration_ConsumerRestartWithExplicitTag(t *testing.T) {
 	}
 }
 
-// TestIntegration_ConsumerStartRefusesUncancelledTag covers what happens when
-// the cancel could not be sent: the tag is still registered on the channel, so
-// consuming with it again would earn the connection-level 530 above. Start must
-// refuse locally instead of letting that reach the broker.
+// TestIntegration_ConsumerStartRetriesPendingCancel covers the cancel that
+// could not be sent — the channel was busy past the point where it gives up,
+// which is what an unresponsive broker looks like.
 //
-// The cancel is made to fail by holding the channel's lock past the point where
-// it gives up waiting, which is the same thing an unresponsive broker does.
+// The tag is then still registered, so the next Start would earn a
+// connection-level 530. It must not simply refuse from then on either: nothing
+// else re-establishes a consumer's channel, so a single failed cancel would
+// make Start useless for the rest of the consumer's life. It retries first.
+func TestIntegration_ConsumerStartRetriesPendingCancel(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost retrying a pending cancel: %v", err)
+	})
+
+	origSlot := channelSlotTimeout
+	channelSlotTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { channelSlotTimeout = origSlot })
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)).
+		WithConsumerTag("retry-tag"))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := waitForQueueConsumers(t, conn, queue, 1); got != 1 {
+		t.Fatalf("queue has %d consumers while started, want 1", got)
+	}
+
+	// Stand in for a call the cancel cannot get past.
+	consumer.rpcMu.Lock()
+	consumer.Stop()
+	consumer.rpcMu.Unlock()
+
+	// The subscription outlived the Stop, as it must when the cancel failed.
+	if got := queueConsumers(t, conn, queue); got != 1 {
+		t.Fatalf("queue has %d consumers after a cancel that could not be sent, want 1", got)
+	}
+
+	// Start retries it rather than refusing forever.
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("restart after a cancel that could not be sent: %v", err)
+	}
+	if got := waitForQueueConsumers(t, conn, queue, 1); got != 1 {
+		t.Fatalf("queue has %d consumers after the restart, want 1", got)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+}
+
+// TestIntegration_ConsumerStartRefusesUncancelledTag covers the case where even
+// the retry cannot get through: the tag really is still registered, so Start
+// must refuse locally rather than let the broker answer with the
+// connection-level 530 that would take every other publisher and consumer with
+// it.
 func TestIntegration_ConsumerStartRefusesUncancelledTag(t *testing.T) {
 	conn := integrationConn(t)
 
@@ -2052,12 +2110,13 @@ func TestIntegration_ConsumerStartRefusesUncancelledTag(t *testing.T) {
 		t.Fatalf("queue has %d consumers while started, want 1", got)
 	}
 
-	// Stand in for a call the cancel cannot get past.
+	// Held across both the Stop and the Start, so the retry fails too.
 	consumer.rpcMu.Lock()
 	consumer.Stop()
+	_, err = consumer.Start(ctx)
 	consumer.rpcMu.Unlock()
 
-	if _, err := consumer.Start(ctx); !errors.Is(err, ErrConsumerTagInUse) {
+	if !errors.Is(err, ErrConsumerTagInUse) {
 		t.Fatalf("restart with an uncancelled tag = %v, want ErrConsumerTagInUse", err)
 	}
 

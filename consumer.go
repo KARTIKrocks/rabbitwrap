@@ -317,12 +317,15 @@ type Consumer struct {
 	// one at a time; the slice exists so a loop that outlives the Stop which
 	// cancelled it is still tracked.
 	loops []consumeLoopHandle
-	// uncancelled names a subscription still registered on c.channel because
-	// its basic.cancel did not complete. Consuming again with that tag on the
-	// same channel earns a connection-level 530, so Start refuses while it is
-	// set. Cleared when the channel is replaced, which takes its registrations
-	// with it.
-	uncancelled string
+	// uncancelled names a subscription still registered because its
+	// basic.cancel did not complete, and uncancelledOn is the channel it is
+	// registered on. Consuming again with that tag on that channel earns a
+	// connection-level 530, so Start refuses while it is set — after retrying
+	// the cancel, so one failure does not refuse every Start from then on.
+	// Cleared when the cancel finally lands, and when the channel is replaced,
+	// which takes its registrations with it.
+	uncancelled   string
+	uncancelledOn *Channel
 	// rpcMu serialises the synchronous AMQP calls this consumer issues on
 	// c.channel — the consume loop's basic.consume, the queue and exchange
 	// helpers, and the channel.close in Close. amqp091 does not serialise them
@@ -435,6 +438,7 @@ func (c *Consumer) setupChannel() error {
 	// Registrations live on the channel, so a fresh one frees every tag the
 	// last one was still holding.
 	c.uncancelled = ""
+	c.uncancelledOn = nil
 	c.mu.Unlock()
 
 	// Close the channel being replaced; when re-setup happens on a healthy
@@ -747,6 +751,13 @@ func (c *Consumer) DeadLetterQueueName() string {
 // Start starts consuming messages and returns a delivery channel.
 // The delivery channel is automatically re-established on reconnection.
 func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
+	// Give an outstanding cancel another go first. Nothing else re-establishes
+	// a consumer's channel — that is the consume loop's job, and the case this
+	// matters in is precisely the one with no loop running — so without this a
+	// single failed cancel would refuse every Start from here on, and closing
+	// the consumer would be the only way out.
+	c.retryPendingCancel()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1431,6 +1442,7 @@ func (c *Consumer) cancelSubscription(ch *Channel, tag string) {
 	if closing || ch.ch.IsClosed() {
 		// Closing takes the channel with it, and a channel already gone took
 		// its registrations along.
+		c.clearUncancelled(ch, tag)
 		return
 	}
 
@@ -1445,6 +1457,32 @@ func (c *Consumer) cancelSubscription(ch *Channel, tag string) {
 	if err != nil {
 		c.log.Warnf("consumer: could not cancel subscription %q: %v", tag, err)
 		c.markUncancelled(ch, tag)
+		return
+	}
+	c.clearUncancelled(ch, tag)
+}
+
+// retryPendingCancel gives an outstanding basic.cancel another attempt. It is a
+// no-op in the ordinary case, where there is nothing outstanding.
+func (c *Consumer) retryPendingCancel() {
+	c.mu.RLock()
+	ch, tag := c.uncancelledOn, c.uncancelled
+	c.mu.RUnlock()
+	if ch == nil {
+		return
+	}
+	c.cancelSubscription(ch, tag)
+}
+
+// clearUncancelled forgets a recorded subscription once it is known to be gone,
+// whether because the cancel landed or because its channel did. Keyed on both
+// tag and channel so it cannot clear a record some other subscription made.
+func (c *Consumer) clearUncancelled(ch *Channel, tag string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.uncancelled == tag && c.uncancelledOn == ch {
+		c.uncancelled = ""
+		c.uncancelledOn = nil
 	}
 }
 
@@ -1460,6 +1498,7 @@ func (c *Consumer) markUncancelled(ch *Channel, tag string) {
 	defer c.mu.Unlock()
 	if c.channel == ch && !c.closed {
 		c.uncancelled = tag
+		c.uncancelledOn = ch
 	}
 }
 
