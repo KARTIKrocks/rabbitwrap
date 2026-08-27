@@ -61,6 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issued on a channel that already has a request outstanding, which is the one
   thing that must not happen to it.
 
+- **Closing a channel that is being replaced now waits its turn too.** Both
+  `setupChannel` implementations close the channel they replace, and a call can
+  be in flight on exactly that channel — the helpers capture the channel before
+  taking their turn, so the one in use is the one being retired. The close now
+  takes the same lock, and leaves the channel open rather than close one still
+  in use.
+
+- **The publisher had the same gap.** `DeclareExchange` and the delay-queue
+  declare behind `PublishDelayed` are synchronous calls on `p.channel`, which
+  `setupChannel` retires on every reconnect and `Close` closes — none of it
+  serialised. Publishes themselves are asynchronous sends, not calls, so they
+  are deliberately still not serialised and throughput is unaffected.
+
 ### Changed
 
 - **A consumer consumes once.** `Start`, and so `Consume`, now returns the new

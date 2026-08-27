@@ -1667,6 +1667,133 @@ func TestIntegration_ConsumerHelpersRefusedAfterClose(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
+// TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight pins the order
+// setupChannel must keep when it retires the channel it is replacing.
+//
+// A helper can be mid-call on exactly that channel: withChannel captures the
+// channel before taking rpcMu, so the one in use is the one being retired. A
+// channel.close sent alongside that call can be answered with its reply, after
+// which the close never completes and the channel id is never released.
+//
+// Holding rpcMu here stands in for that in-flight call, which makes the
+// ordering observable rather than left to a race: the old channel must still be
+// open while the lock is held, and closed once it is released.
+func TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight(t *testing.T) {
+	conn := integrationConn(t)
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	// Not started: the consume loop would be the other user of rpcMu, and this
+	// test is about the helpers.
+	consumer.mu.RLock()
+	old := consumer.channel
+	consumer.mu.RUnlock()
+	if old == nil {
+		t.Fatal("expected the consumer to have a channel after construction")
+	}
+
+	consumer.rpcMu.Lock() // a helper is now "mid-call" on old
+
+	setupDone := make(chan error, 1)
+	go func() { setupDone <- consumer.setupChannel() }()
+
+	// Long enough that an unserialised close would have happened by now:
+	// setupChannel installs the replacement first and only then retires old.
+	time.Sleep(300 * time.Millisecond)
+	if old.ch.IsClosed() {
+		consumer.rpcMu.Unlock()
+		t.Fatal("the replaced channel was closed while a call was still outstanding on it")
+	}
+
+	consumer.rpcMu.Unlock()
+
+	select {
+	case err := <-setupDone:
+		if err != nil {
+			t.Fatalf("setupChannel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("setupChannel never returned")
+	}
+
+	// And it is closed once the call is done, rather than leaked.
+	deadline := time.Now().Add(5 * time.Second)
+	for !old.ch.IsClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the replaced channel was never closed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_PublisherReplacedChannelWaitsForCallInFlight is the publisher
+// side of TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight. Its
+// publishes are asynchronous sends, but DeclareExchange and the delay-queue
+// declare behind PublishDelayed are synchronous calls on the same channel that
+// setupChannel retires on every reconnect.
+func TestIntegration_PublisherReplacedChannelWaitsForCallInFlight(t *testing.T) {
+	conn := integrationConn(t)
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	pub.mu.RLock()
+	old := pub.channel
+	pub.mu.RUnlock()
+	if old == nil {
+		t.Fatal("expected the publisher to have a channel after construction")
+	}
+
+	pub.rpcMu.Lock() // a declare is now "mid-call" on old
+
+	setupDone := make(chan error, 1)
+	go func() { setupDone <- pub.setupChannel() }()
+
+	time.Sleep(300 * time.Millisecond)
+	if old.ch.IsClosed() {
+		pub.rpcMu.Unlock()
+		t.Fatal("the replaced channel was closed while a call was still outstanding on it")
+	}
+
+	pub.rpcMu.Unlock()
+
+	select {
+	case err := <-setupDone:
+		if err != nil {
+			t.Fatalf("setupChannel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("setupChannel never returned")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !old.ch.IsClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the replaced channel was never closed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
 // assertRoundTrip publishes a message on conn and requires a consumer on the
 // same connection to receive it, proving the connection is still fully usable.
 func assertRoundTrip(t *testing.T, conn *Connection) {

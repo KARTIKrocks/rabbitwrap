@@ -418,8 +418,21 @@ func (c *Consumer) setupChannel() error {
 	// Close the channel being replaced; when re-setup happens on a healthy
 	// connection (e.g. after the queue was deleted) it would otherwise stay
 	// open and leak.
+	//
+	// A helper can be mid-call on that very channel: withChannel captures the
+	// channel before taking rpcMu, so the one it is using is the one being
+	// replaced here. Closing it out from under that call is the same
+	// reply-mixing hazard as anywhere else, so take rpcMu first — and if the
+	// call will not finish, leave the channel open rather than close one still
+	// in use. It costs a channel id until the connection reclaims it, which is
+	// the cheaper loss (see ErrChannelBusy).
 	if old != nil {
-		_ = old.Close()
+		if c.acquireChannelSlot() {
+			_ = old.Close()
+			c.rpcMu.Unlock()
+		} else {
+			c.log.Errorf("consumer: leaving the replaced channel open because a call on it is still in flight; it is released when the connection closes")
+		}
 	}
 
 	// The signal is drained by the consume loop, so re-establishment happens
@@ -1243,7 +1256,7 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 		// for rpcMu; this only waits out one that was already in flight. If even
 		// that does not finish, the channel is left open for the same reason a
 		// stuck loop leaves it open.
-		if !c.acquireChannelForClose() {
+		if !c.acquireChannelSlot() {
 			c.log.Errorf("consumer: leaving the channel open because a call on it is still in flight; it is released when the connection closes")
 			return ErrChannelBusy
 		}
@@ -1314,21 +1327,18 @@ func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) bool {
 	return true
 }
 
-// acquireChannelForClose takes rpcMu so Close can close the channel without
-// colliding with a call already on it, giving up after consumeLoopStopTimeout
-// rather than letting an unresponsive broker hold Close open. It reports whether
-// the lock was taken; the caller must unlock it if so.
-func (c *Consumer) acquireChannelForClose() bool {
-	deadline := time.Now().Add(consumeLoopStopTimeout)
-	for {
-		if c.rpcMu.TryLock() {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(time.Millisecond)
-	}
+// acquireChannelSlot takes rpcMu so a channel can be closed without colliding
+// with a call already outstanding on it, giving up after consumeLoopStopTimeout
+// rather than letting an unresponsive broker hold the caller open. It reports
+// whether the lock was taken; the caller must unlock it if so.
+//
+// A channel.close is a synchronous call like any other, and one sent while a
+// request is outstanding on the same channel can be answered with that
+// request's reply — after which the close never completes and the channel id is
+// never released. So every close of a channel this consumer has handed to
+// callers goes through here.
+func (c *Consumer) acquireChannelSlot() bool {
+	return acquireSlot(&c.rpcMu)
 }
 
 // awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by

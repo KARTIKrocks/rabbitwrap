@@ -59,6 +59,33 @@ var (
 	ErrDrop = errors.New("rabbitmq: drop message")
 )
 
+// channelSlotTimeout bounds how long a close waits for a synchronous call
+// already outstanding on the same channel to finish. A variable so tests can
+// shorten it.
+var channelSlotTimeout = 5 * time.Second
+
+// acquireSlot takes mu, giving up after channelSlotTimeout rather than letting
+// an unresponsive broker hold the caller open forever. It reports whether the
+// lock was taken; the caller must unlock it if so.
+//
+// It exists because a channel.close is a synchronous call like any other, and
+// one sent while a request is outstanding on the same channel can be answered
+// with that request's reply — after which the close never completes and the
+// channel id is never released. Publishers and consumers both close channels
+// they have handed to callers, so both need it.
+func acquireSlot(mu *sync.Mutex) bool {
+	deadline := time.Now().Add(channelSlotTimeout)
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // Config holds the RabbitMQ connection configuration.
 type Config struct {
 	// URL is the AMQP connection URL.
