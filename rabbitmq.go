@@ -75,6 +75,29 @@ var (
 // shorten it.
 var channelSlotTimeout = 5 * time.Second
 
+// closeChannelTimeout bounds how long closeChannelBounded waits for a
+// channel.close to be answered. A variable so tests can shorten it.
+var closeChannelTimeout = 5 * time.Second
+
+// closeChannelBounded closes ch, giving up after closeChannelTimeout. A
+// channel.close is a synchronous call, so a broker that has stopped answering
+// would otherwise block the caller — and the callers here are Close methods,
+// which must return. An abandoned channel is reclaimed when the connection
+// closes. Returns the close error, or nil when it was abandoned; what is logged
+// on abandonment is prefixed with what.
+func closeChannelBounded(ch *Channel, log Logger, what string) error {
+	done := make(chan error, 1)
+	go func() { done <- ch.Close() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(closeChannelTimeout):
+		log.Warnf("%s close timed out; it is released when the connection closes", what)
+		return nil
+	}
+}
+
 // acquireSlot takes mu, giving up after channelSlotTimeout rather than letting
 // an unresponsive broker hold the caller open forever. It reports whether the
 // lock was taken; the caller must unlock it if so.

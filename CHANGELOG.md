@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Close` no longer waits on a broker that has stopped answering.** Both
+  channels a consumer holds are closed with a synchronous `channel.close`, and
+  the queue/exchange one was closed without a bound — so a quiet broker held
+  `Close` for as long as the connection's heartbeat took to give up on it, and
+  with `WithHeartbeat(0)` there is nothing to give up. Both closes are now
+  bounded by the same helper, and a channel that cannot be closed is abandoned
+  for the connection to reclaim. A failure to close it is logged, where it was
+  silently discarded.
+
 - **Queue and exchange calls report a down connection as `ErrNotConnected`**
   rather than `ErrChannelClosed`. They now open their channel on demand, so a
   connection that is not there is what the failure actually is.

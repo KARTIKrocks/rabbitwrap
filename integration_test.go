@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1841,6 +1843,87 @@ func TestIntegration_ConsumerHelperRefusedWhenCloseRacesIt(t *testing.T) {
 
 	if !conn.IsHealthy() {
 		t.Fatal("connection is no longer healthy")
+	}
+}
+
+// TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker pins that Close
+// returns when the broker has stopped answering.
+//
+// Both channels a consumer holds are closed with a synchronous channel.close,
+// and a broker that has gone quiet never answers one. Close has to return
+// regardless: abandoning a channel costs an id until the connection goes,
+// where hanging costs the caller's shutdown.
+//
+// The broker is paused rather than stopped, so the connection stays up and the
+// close really is left waiting — which is what an unresponsive broker does, and
+// what closing the connection instead would not reproduce.
+//
+// The deadline is what makes this discriminating. An unbounded close is not
+// infinite here: amqp091's heartbeat gives up on the peer after about fifteen
+// seconds and fails the call for it. So the test asserts a time well inside
+// that, not merely that Close returns — otherwise it would pass either way.
+// With Heartbeat set to 0 there is nothing to give up, and unbounded really
+// would mean forever.
+func TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+
+	// Open the queue/exchange channel, so Close has both to deal with.
+	if _, err := consumer.PurgeQueue(queue); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	origClose, origSlot := closeChannelTimeout, channelSlotTimeout
+	closeChannelTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeChannelTimeout, channelSlotTimeout = origClose, origSlot })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- consumer.Close() }()
+
+	select {
+	case <-done:
+		// Any outcome is fine; returning promptly is the point.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the channel")
+	}
+}
+
+// composeBrokerOrSkip returns the compose broker's container name, skipping
+// when the suite is pointed somewhere else — pausing the wrong container would
+// prove nothing.
+func composeBrokerOrSkip(t *testing.T) string {
+	t.Helper()
+	if url := os.Getenv("RABBITMQ_URL"); url != "" && !strings.Contains(url, ":5672") {
+		t.Skip("needs the compose broker; RABBITMQ_URL points elsewhere")
+	}
+	const container = "rabbitwrap-rabbitmq-1"
+	if err := exec.Command("docker", "inspect", container).Run(); err != nil {
+		t.Skipf("needs the compose broker container %q", container)
+	}
+	return container
+}
+
+func pauseBroker(t *testing.T, container string) {
+	t.Helper()
+	if out, err := exec.Command("docker", "pause", container).CombinedOutput(); err != nil {
+		t.Skipf("cannot pause the broker: %v: %s", err, out)
+	}
+}
+
+func unpauseBroker(t *testing.T, container string) {
+	t.Helper()
+	if out, err := exec.Command("docker", "unpause", container).CombinedOutput(); err != nil {
+		t.Logf("could not unpause the broker: %v: %s", err, out)
 	}
 }
 

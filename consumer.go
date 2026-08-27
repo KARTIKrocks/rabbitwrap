@@ -1161,8 +1161,9 @@ func (c *Consumer) withChannel(fn func(*Channel) error) error {
 
 	if c.opsCh != nil && c.opsCh.ch.IsClosed() {
 		// Already gone — the broker closed it under a refused declaration, or
-		// the connection went. Closing it again is how its id is released.
-		_ = c.opsCh.Close()
+		// the connection went. Its id was released by whatever closed it, and
+		// amqp091's Close returns immediately on an already-closed channel, so
+		// there is nothing to close here: just drop it and open a fresh one.
 		c.opsCh = nil
 	}
 	if c.opsCh == nil {
@@ -1386,16 +1387,7 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	}
 
 	if ch != nil {
-		// Use a goroutine to avoid hanging on a broken channel close.
-		done := make(chan error, 1)
-		go func() { done <- ch.Close() }()
-		select {
-		case err := <-done:
-			return err
-		case <-time.After(5 * time.Second):
-			c.log.Warnf("consumer: channel close timed out")
-			return nil
-		}
+		return closeChannelBounded(ch, c.log, "consumer: channel")
 	}
 	return nil
 }
@@ -1493,9 +1485,11 @@ func (c *Consumer) cancelSubscription(ch *Channel, tag string) {
 
 // closeOpsChannel closes the channel the queue and exchange helpers run on, if
 // one was ever opened. c.closed is already set, so no further call can take
-// opsMu; this only waits out one already in flight, and gives up rather than
-// let an unresponsive broker hold Close open — an abandoned channel is released
-// when the connection closes.
+// opsMu; this only waits out one already in flight.
+//
+// Both waits here are bounded — for opsMu, and then for the close itself — so
+// an unresponsive broker cannot hold Close open at either step. An abandoned
+// channel is released when the connection closes.
 func (c *Consumer) closeOpsChannel() {
 	if !acquireSlot(&c.opsMu) {
 		c.log.Warnf("consumer: leaving the queue/exchange channel open because a call on it is still in flight; it is released when the connection closes")
@@ -1504,7 +1498,15 @@ func (c *Consumer) closeOpsChannel() {
 	defer c.opsMu.Unlock()
 
 	if c.opsCh != nil {
-		_ = c.opsCh.Close()
+		// Bounded for the same reason the consume channel's close is: this runs
+		// inside Close, which has to return.
+		if err := closeChannelBounded(c.opsCh, c.log, "consumer: queue/exchange channel"); err != nil {
+			// Not returned: Close already reports on the consume channel, and a
+			// failure here does not change what the caller should do. Worth
+			// saying, though — it is the only sign the channel was not released
+			// cleanly.
+			c.log.Warnf("consumer: closing the queue/exchange channel: %v", err)
+		}
 		c.opsCh = nil
 	}
 }
