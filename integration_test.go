@@ -1880,9 +1880,9 @@ func TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker(t *testing.T) {
 		t.Fatalf("purge: %v", err)
 	}
 
-	origClose, origSlot := closeChannelTimeout, channelSlotTimeout
-	closeChannelTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { closeChannelTimeout, channelSlotTimeout = origClose, origSlot })
+	origClose, origSlot := closeTimeout, channelSlotTimeout
+	closeTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeTimeout, channelSlotTimeout = origClose, origSlot })
 
 	pauseBroker(t, container)
 	defer unpauseBroker(t, container)
@@ -1895,6 +1895,66 @@ func TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker(t *testing.T) {
 		// Any outcome is fine; returning promptly is the point.
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close waited on an unresponsive broker instead of abandoning the channel")
+	}
+}
+
+// TestIntegration_PublisherCloseSurvivesUnresponsiveBroker is the publisher side
+// of TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker. Same reasoning,
+// same discriminating deadline: unbounded is not infinite here, it is however
+// long the connection takes to give up on a silent peer.
+func TestIntegration_PublisherCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn := integrationConn(t)
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+
+	origClose, origSlot := closeTimeout, channelSlotTimeout
+	closeTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeTimeout, channelSlotTimeout = origClose, origSlot })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- pub.Close() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the channel")
+	}
+}
+
+// TestIntegration_ConnectionCloseSurvivesUnresponsiveBroker is the connection
+// side, and the one that mattered most: unlike a channel's close, nothing was
+// left to notice the broker had gone quiet and fail the call for it — measured
+// still blocked after thirty seconds. Connection.Close holds the connection
+// lock throughout, so waiting there stops everything else on it too.
+func TestIntegration_ConnectionCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn, err := NewConnection(integrationConfig(t))
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+
+	orig := closeTimeout
+	closeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { closeTimeout = orig })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- conn.Close() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the connection")
 	}
 }
 

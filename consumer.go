@@ -1295,11 +1295,16 @@ func (c *Consumer) Close() error {
 // complete, the consumer closes immediately.
 //
 // The context bounds the waits that exist for the caller's benefit — draining
-// in-flight handlers and stopping the topology refresh. Close still waits
-// briefly for the consume loops to leave the channel alone, whatever the
-// context says, because closing a channel with a request outstanding on it can
-// break the whole connection (see awaitConsumeLoopsStopped). It is safe to call
-// Close immediately after Start.
+// in-flight handlers and stopping the topology refresh. The rest are not the
+// caller's to trade away, because they protect a connection shared with
+// unrelated publishers and consumers: waiting for the consume loops to leave
+// the channel alone, and closing each of the consumer's two channels without a
+// request still outstanding on it (see awaitConsumeLoopsStopped). It is safe to
+// call Close immediately after Start.
+//
+// Each of those has its own cap of a few seconds and they are additive, so
+// against a broker that has stopped answering entirely Close can take some
+// tens of seconds whatever the context says. It always returns.
 //
 // If a consume loop is still waiting on the broker after that, or a call on the
 // channel is still in flight, Close returns ErrChannelBusy and deliberately
