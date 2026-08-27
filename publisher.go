@@ -178,9 +178,17 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 // holding rpcMu so it cannot overlap another or the close of the very channel
 // it is using. It refuses once the publisher is closed.
 //
-// p.mu is released before rpcMu is taken, so a call waiting its turn never
-// blocks the reconnect path that needs p.mu to install a new channel.
+// The channel is read *after* rpcMu is taken, for the reason given on
+// Consumer.withChannel: retiring a channel goes through rpcMu too, so owning it
+// first is what makes the channel read here current for the whole call.
+//
+// This is the only place that holds rpcMu and p.mu at once, and it takes them
+// in that order. Nothing acquires rpcMu while holding p.mu — Close and
+// setupChannel both release it first — so the pair cannot deadlock.
 func (p *Publisher) withChannel(fn func(*Channel) error) error {
+	p.rpcMu.Lock()
+	defer p.rpcMu.Unlock()
+
 	p.mu.RLock()
 	ch, closed := p.channel, p.closed
 	p.mu.RUnlock()
@@ -191,8 +199,6 @@ func (p *Publisher) withChannel(fn func(*Channel) error) error {
 		return ErrChannelClosed
 	}
 
-	p.rpcMu.Lock()
-	defer p.rpcMu.Unlock()
 	return fn(ch)
 }
 
@@ -610,29 +616,34 @@ func (p *Publisher) DeclareExchange(name string, kind ExchangeType, durable, aut
 // Close closes the publisher.
 func (p *Publisher) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 
 	p.closed = true
 	p.conn.unsubscribeReconnect(p.reconnectCh)
 	close(p.reconnectCh)
+	ch := p.channel
+	// Released before rpcMu is taken below: withChannel holds rpcMu while it
+	// reads p.mu, so waiting for rpcMu with p.mu still held would deadlock the
+	// pair against each other.
+	p.mu.Unlock()
 
-	if p.channel != nil {
-		// channel.close is synchronous like the declares, so it takes its turn.
-		// p.closed is already set, so no further call can join the queue for
-		// rpcMu; this only waits out one already in flight. If even that does
-		// not finish, the channel is left open for the connection to reclaim.
-		if !p.acquireChannelSlot() {
-			p.log.Errorf("publisher: leaving the channel open because a call on it is still in flight; it is released when the connection closes")
-			return ErrChannelBusy
-		}
-		defer p.rpcMu.Unlock()
-		return p.channel.Close()
+	if ch == nil {
+		return nil
 	}
-	return nil
+
+	// channel.close is synchronous like the declares, so it takes its turn.
+	// p.closed is already set, so no further call can join the queue for rpcMu;
+	// this only waits out one already in flight. If even that does not finish,
+	// the channel is left open for the connection to reclaim.
+	if !p.acquireChannelSlot() {
+		p.log.Errorf("publisher: leaving the channel open because a call on it is still in flight; it is released when the connection closes")
+		return ErrChannelBusy
+	}
+	defer p.rpcMu.Unlock()
+	return ch.Close()
 }
 
 // IsClosed returns true if the publisher is closed.

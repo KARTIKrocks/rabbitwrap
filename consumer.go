@@ -896,10 +896,19 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		c.rpcMu.Unlock()
 		if err != nil {
 			c.log.Errorf("consumer: consume failed: %v, waiting for reconnect", err)
-			_ = ch.Close()
+			// Callers can be waiting their turn on this channel, so retiring it
+			// takes rpcMu like every other close of it does. Clear it first, so
+			// a call that gets the lock next finds no channel rather than this
+			// one.
 			c.mu.Lock()
 			c.channel = nil
 			c.mu.Unlock()
+			if c.acquireChannelSlot() {
+				_ = ch.Close()
+				c.rpcMu.Unlock()
+			} else {
+				c.log.Errorf("consumer: leaving the spent channel open because a call on it is still in flight; it is released when the connection closes")
+			}
 			if !c.waitForReconnect(ctx) {
 				return
 			}
@@ -1041,9 +1050,19 @@ func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, 
 // channel open because something was still using it (see ErrChannelBusy), and a
 // call issued on that channel is exactly what must not happen to it.
 //
-// c.mu is released before rpcMu is taken, so the consume loop — which needs
-// c.mu to read the channel — is never blocked behind a call waiting its turn.
+// The channel is read *after* rpcMu is taken, not before. Retiring a channel
+// also goes through rpcMu, so owning it first means the channel read here is
+// the current one and stays current for the whole call — where reading first
+// would let a replacement land in between and leave the call to run against a
+// channel that had since been closed.
+//
+// This is the only place that holds rpcMu and c.mu at once, and it takes them
+// in that order. Nothing acquires rpcMu while holding c.mu — every close site
+// releases c.mu first — so the pair cannot deadlock.
 func (c *Consumer) withChannel(fn func(*Channel) error) error {
+	c.rpcMu.Lock()
+	defer c.rpcMu.Unlock()
+
 	c.mu.RLock()
 	ch, closed := c.channel, c.closed
 	c.mu.RUnlock()
@@ -1054,8 +1073,6 @@ func (c *Consumer) withChannel(fn func(*Channel) error) error {
 		return ErrChannelClosed
 	}
 
-	c.rpcMu.Lock()
-	defer c.rpcMu.Unlock()
 	return fn(ch)
 }
 

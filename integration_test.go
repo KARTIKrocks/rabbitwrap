@@ -1737,6 +1737,75 @@ func TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
+// TestIntegration_ConsumerCallUsesTheChannelItWaitedFor pins the other half of
+// the ordering: a call must pick its channel *after* it owns rpcMu, not before.
+//
+// Reading first leaves a window — the call captures the current channel, then
+// waits for the lock, and a replacement lands in between — after which the call
+// runs against a channel that has since been retired and fails for no reason
+// the caller could have avoided.
+//
+// The replacement here is done by hand rather than by racing setupChannel, so
+// the interleaving is forced instead of hoped for: the call is parked on the
+// lock while the channel it would have captured is swapped out and closed.
+func TestIntegration_ConsumerCallUsesTheChannelItWaitedFor(t *testing.T) {
+	conn := integrationConn(t)
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	consumer.mu.RLock()
+	old := consumer.channel
+	consumer.mu.RUnlock()
+
+	consumer.rpcMu.Lock()
+
+	// Parks on rpcMu. What it must not do is decide which channel to use before
+	// getting there.
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := consumer.PurgeQueue(queue)
+		callErr <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let it reach the lock
+
+	// Exactly what setupChannel does while a call waits: install the
+	// replacement, then retire the channel it replaced.
+	fresh, err := conn.Channel()
+	if err != nil {
+		consumer.rpcMu.Unlock()
+		t.Fatalf("open replacement channel: %v", err)
+	}
+	consumer.mu.Lock()
+	consumer.channel = fresh
+	consumer.mu.Unlock()
+	if err := old.Close(); err != nil {
+		consumer.rpcMu.Unlock()
+		t.Fatalf("close the replaced channel: %v", err)
+	}
+
+	consumer.rpcMu.Unlock()
+
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("call failed against a channel retired while it waited: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never returned")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
 // TestIntegration_PublisherReplacedChannelWaitsForCallInFlight is the publisher
 // side of TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight. Its
 // publishes are asynchronous sends, but DeclareExchange and the delay-queue
@@ -1786,6 +1855,61 @@ func TestIntegration_PublisherReplacedChannelWaitsForCallInFlight(t *testing.T) 
 			t.Fatal("the replaced channel was never closed")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_PublisherCallUsesTheChannelItWaitedFor is the publisher side
+// of TestIntegration_ConsumerCallUsesTheChannelItWaitedFor.
+func TestIntegration_PublisherCallUsesTheChannelItWaitedFor(t *testing.T) {
+	conn := integrationConn(t)
+
+	exchange := uniqueQueue(t) + ".ex"
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub.mu.RLock()
+	old := pub.channel
+	pub.mu.RUnlock()
+
+	pub.rpcMu.Lock()
+
+	callErr := make(chan error, 1)
+	go func() {
+		callErr <- pub.DeclareExchange(exchange, ExchangeDirect, false, true, nil)
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	fresh, err := conn.Channel()
+	if err != nil {
+		pub.rpcMu.Unlock()
+		t.Fatalf("open replacement channel: %v", err)
+	}
+	pub.mu.Lock()
+	pub.channel = fresh
+	pub.mu.Unlock()
+	if err := old.Close(); err != nil {
+		pub.rpcMu.Unlock()
+		t.Fatalf("close the replaced channel: %v", err)
+	}
+
+	pub.rpcMu.Unlock()
+
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("call failed against a channel retired while it waited: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never returned")
 	}
 
 	if !conn.IsHealthy() {

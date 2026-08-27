@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serialised. Publishes themselves are asynchronous sends, not calls, so they
   are deliberately still not serialised and throughput is unaffected.
 
+- **A call now picks its channel after it owns the lock, not before.** Reading
+  first left a window: the call captured the current channel, then waited its
+  turn, and a replacement landing in between left it running against a channel
+  that had since been retired — a `504 channel/connection is not open` the
+  caller could do nothing about, during recovery, when it is least welcome.
+  Both consumer and publisher were affected. The consume loop's own failure
+  path also retired its channel without taking the lock, which could have
+  closed one out from under a call waiting on it.
+
 ### Changed
 
 - **A consumer consumes once.** `Start`, and so `Consume`, now returns the new
