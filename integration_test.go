@@ -1918,6 +1918,186 @@ func TestIntegration_PublisherCallUsesTheChannelItWaitedFor(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
+// TestIntegration_ConsumerStopCancelsSubscription pins that stopping a consumer
+// unregisters it at the broker rather than leaving it registered until the
+// channel closes.
+//
+// A subscription that outlives its loop still gets its share of the queue's
+// round-robin, so messages go to a consumer nobody is reading. Before the fix
+// the queue's consumer count climbed with every cycle — 1, 2, 3, 4 — and only
+// closing the consumer brought it back down.
+func TestIntegration_ConsumerStopCancelsSubscription(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during Start/Stop cycles: %v", err)
+	})
+
+	// Durable rather than auto-delete: cancelling the last consumer of an
+	// auto-delete queue deletes it, which is correct and is what the missing
+	// cancel used to hide.
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for i := 1; i <= 4; i++ {
+		if _, err := consumer.Start(ctx); err != nil {
+			t.Fatalf("cycle %d: start: %v", i, err)
+		}
+		if got := waitForQueueConsumers(t, conn, queue, 1); got != 1 {
+			t.Fatalf("cycle %d: queue has %d consumers while started, want 1", i, got)
+		}
+
+		consumer.Stop()
+
+		// Stop cancels before it returns, so this needs no settling time.
+		if got := queueConsumers(t, conn, queue); got != 0 {
+			t.Fatalf("cycle %d: queue still has %d consumer(s) after Stop", i, got)
+		}
+	}
+}
+
+// TestIntegration_ConsumerRestartWithExplicitTag pins the case that used to take
+// the whole connection down: a configured consumer tag is registered on the
+// channel until it is cancelled, so consuming again with one still registered
+// is answered with a connection-level 530 NOT_ALLOWED — which kills every
+// publisher and consumer sharing the connection, not just this consumer.
+func TestIntegration_ConsumerRestartWithExplicitTag(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost restarting a consumer with a configured tag: %v", err)
+	})
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)).
+		WithConsumerTag("restart-tag"))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	// The collision needs a subscription to actually exist: stopping before the
+	// basic.consume goes out leaves nothing registered and nothing to collide
+	// with, which would make this test pass for the wrong reason.
+	if got := waitForQueueConsumers(t, conn, queue, 1); got != 1 {
+		t.Fatalf("queue has %d consumers while started, want 1", got)
+	}
+	consumer.Stop()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("restart with the same tag: %v", err)
+	}
+
+	// And it is really consuming again, not merely accepted.
+	if err := pub.PublishText(ctx, "after-restart"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "after-restart")
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+}
+
+// TestIntegration_ConsumerStartRefusesUncancelledTag covers what happens when
+// the cancel could not be sent: the tag is still registered on the channel, so
+// consuming with it again would earn the connection-level 530 above. Start must
+// refuse locally instead of letting that reach the broker.
+//
+// The cancel is made to fail by holding the channel's lock past the point where
+// it gives up waiting, which is the same thing an unresponsive broker does.
+func TestIntegration_ConsumerStartRefusesUncancelledTag(t *testing.T) {
+	conn := integrationConn(t)
+
+	origSlot := channelSlotTimeout
+	channelSlotTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { channelSlotTimeout = origSlot })
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)).
+		WithConsumerTag("stuck-tag"))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := waitForQueueConsumers(t, conn, queue, 1); got != 1 {
+		t.Fatalf("queue has %d consumers while started, want 1", got)
+	}
+
+	// Stand in for a call the cancel cannot get past.
+	consumer.rpcMu.Lock()
+	consumer.Stop()
+	consumer.rpcMu.Unlock()
+
+	if _, err := consumer.Start(ctx); !errors.Is(err, ErrConsumerTagInUse) {
+		t.Fatalf("restart with an uncancelled tag = %v, want ErrConsumerTagInUse", err)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// queueConsumers reports how many consumers the broker has registered on a
+// queue, via a passive declare on a throwaway channel.
+func queueConsumers(t *testing.T, conn *Connection, queue string) int {
+	t.Helper()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("channel for inspecting %q: %v", queue, err)
+	}
+	defer ch.Close()
+	q, err := ch.Raw().QueueDeclarePassive(queue, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, nil)
+	if err != nil {
+		t.Fatalf("inspect queue %q: %v", queue, err)
+	}
+	return q.Consumers
+}
+
+// waitForQueueConsumers waits for the broker to report want consumers on the
+// queue, since basic.consume completing at the client is not the same moment
+// the broker has it registered. Returns the last count seen.
+func waitForQueueConsumers(t *testing.T, conn *Connection, queue string, want int) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := queueConsumers(t, conn, queue)
+		if got == want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // assertRoundTrip publishes a message on conn and requires a consumer on the
 // same connection to receive it, proving the connection is still fully usable.
 func assertRoundTrip(t *testing.T, conn *Connection) {

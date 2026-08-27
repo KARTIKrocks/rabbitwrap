@@ -34,6 +34,13 @@ var (
 	// The consumer is closed and delivers nothing further; its channel is
 	// deliberately left open and is reclaimed when the connection closes.
 	ErrChannelBusy = errors.New("rabbitmq: channel still in use; it was left open")
+	// ErrConsumerTagInUse is returned by Consumer.Start when the configured
+	// consumer tag is still registered on the consumer's channel because an
+	// earlier subscription could not be cancelled. Consuming again with that
+	// tag would be answered with a connection-level 530 NOT_ALLOWED, taking
+	// down every publisher and consumer sharing the connection, so Start
+	// refuses locally instead. It clears once the channel is re-established.
+	ErrConsumerTagInUse = errors.New("rabbitmq: consumer tag is still registered on the channel")
 	// ErrAlreadyConsuming is returned by Consumer.Start (and so by Consume) when
 	// the consumer already has a consume loop running. One consumer consumes
 	// once: a second loop would issue its basic.consume on the same channel as

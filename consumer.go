@@ -2,6 +2,8 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -16,7 +18,18 @@ type ConsumerConfig struct {
 	// Queue is the queue to consume from.
 	Queue string
 
-	// ConsumerTag is the consumer identifier.
+	// ConsumerTag is the consumer identifier, shown against the subscription in
+	// the management UI and in the broker's logs.
+	//
+	// Leave it empty and each Start names its own, which is what makes a
+	// subscription cancellable: the broker will name one itself, but that name
+	// is never handed back to the client, and a subscription whose name is
+	// unknown can only be ended by closing its channel.
+	//
+	// Set it and every Start uses exactly that name. A name is registered on a
+	// channel until it is cancelled, so consuming again with one still
+	// registered is answered with a connection-level 530 — Start returns
+	// ErrConsumerTagInUse rather than let that reach the broker.
 	ConsumerTag string
 
 	// AutoAck enables automatic message acknowledgment.
@@ -304,6 +317,12 @@ type Consumer struct {
 	// one at a time; the slice exists so a loop that outlives the Stop which
 	// cancelled it is still tracked.
 	loops []consumeLoopHandle
+	// uncancelled names a subscription still registered on c.channel because
+	// its basic.cancel did not complete. Consuming again with that tag on the
+	// same channel earns a connection-level 530, so Start refuses while it is
+	// set. Cleared when the channel is replaced, which takes its registrations
+	// with it.
+	uncancelled string
 	// rpcMu serialises the synchronous AMQP calls this consumer issues on
 	// c.channel — the consume loop's basic.consume, the queue and exchange
 	// helpers, and the channel.close in Close. amqp091 does not serialise them
@@ -413,6 +432,9 @@ func (c *Consumer) setupChannel() error {
 	old := c.channel
 	c.channel = ch
 	c.queue = queueName
+	// Registrations live on the channel, so a fresh one frees every tag the
+	// last one was still holding.
+	c.uncancelled = ""
 	c.mu.Unlock()
 
 	// Close the channel being replaced; when re-setup happens on a healthy
@@ -744,6 +766,19 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 		return nil, ErrAlreadyConsuming
 	}
 
+	// One tag per Start, held for the life of this loop: it survives reconnects
+	// so the consumer keeps one identity in the broker's eyes, and it is what
+	// the loop cancels with when it stops.
+	tag := c.config.ConsumerTag
+	if tag == "" {
+		tag = generateConsumerTag()
+	}
+	// A generated tag is fresh every time, so this only ever catches a
+	// configured one that the last subscription is still holding.
+	if tag == c.uncancelled {
+		return nil, fmt.Errorf("%w: %q", ErrConsumerTagInUse, tag)
+	}
+
 	outCh := make(chan *Delivery)
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -754,10 +789,25 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 
 	go func() {
 		defer close(done)
-		c.consumeLoop(ctx, outCh)
+		c.consumeLoop(ctx, outCh, tag)
 	}()
 
 	return outCh, nil
+}
+
+// generateConsumerTag names a subscription when the caller did not.
+//
+// The broker will happily name one itself, but amqp091 does not hand that name
+// back, and a subscription whose name is unknown cannot be cancelled — which is
+// the whole of why the consumer chooses its own.
+func generateConsumerTag() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Only for the tag to stay unique within this process; it is not a
+		// security boundary.
+		return fmt.Sprintf("rabbitwrap-%d", time.Now().UnixNano())
+	}
+	return "rabbitwrap-" + hex.EncodeToString(b[:])
 }
 
 // consumeLoopHandle is one running consume loop: the cancel that stops it, and
@@ -856,8 +906,15 @@ func (c *Consumer) waitForReconnect(ctx context.Context) bool {
 }
 
 // consumeLoop runs the consume loop, automatically recovering on reconnection.
-func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
+func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery, tag string) {
 	defer close(outCh)
+
+	// The channel the subscription is currently registered on, or nil when
+	// there is none to cancel. Cancelling is what stops the broker sending to a
+	// consumer nobody is reading any more; without it the subscription outlives
+	// the loop and only the channel closing ever clears it.
+	var subscribed *Channel
+	defer func() { c.cancelSubscription(subscribed, tag) }()
 
 	for {
 		// Nothing below is worth starting once this loop is finished, and a
@@ -886,7 +943,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 		c.rpcMu.Lock()
 		deliveryCh, err := ch.ch.Consume(
 			queue,
-			c.config.ConsumerTag,
+			tag,
 			c.config.AutoAck,
 			c.config.Exclusive,
 			c.config.NoLocal,
@@ -900,6 +957,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			// takes rpcMu like every other close of it does. Clear it first, so
 			// a call that gets the lock next finds no channel rather than this
 			// one.
+			subscribed = nil // the failed consume registered nothing
 			c.mu.Lock()
 			c.channel = nil
 			c.mu.Unlock()
@@ -915,11 +973,17 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			continue
 		}
 
-		c.log.Infof("consumer: started consuming from queue %q", queue)
+		c.log.Infof("consumer: started consuming from queue %q as %q", queue, tag)
+		subscribed = ch
 
 		if !c.forwardDeliveries(ctx, outCh, deliveryCh) {
 			return
 		}
+
+		// The delivery channel closed, which means the subscription is already
+		// gone — the channel died, or the broker cancelled it. Nothing to
+		// cancel, and the next iteration registers a new one.
+		subscribed = nil
 
 		if !c.waitForReconnect(ctx) {
 			return
@@ -1168,10 +1232,11 @@ func (c *Consumer) DeleteQueue(queue string, ifUnused, ifEmpty bool) (int, error
 // returns would race the request it has outstanding. The timeout is logged, so
 // treat it as a reason to close the consumer rather than restart it.
 //
-// Stopping does not cancel the subscription at the broker, which happens only
-// when the channel is closed, so every Start after a Stop adds another consumer
-// to the queue and the queue's consumer count grows with each cycle. Close the
-// consumer and create a new one rather than cycling one through stop/start.
+// Stopping cancels the subscription at the broker, so the queue stops counting
+// this consumer and stops routing to it. That costs one round-trip, and it has
+// a consequence worth knowing: an auto-delete queue is deleted when its last
+// consumer goes away, so stopping the only consumer of one deletes it. Use a
+// durable queue for anything a stopped consumer should come back to.
 func (c *Consumer) Stop() {
 	c.mu.Lock()
 	loops := c.stopConsumeLoops()
@@ -1342,6 +1407,60 @@ func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) bool {
 		}
 	}
 	return true
+}
+
+// cancelSubscription tells the broker to stop sending to a subscription the
+// consumer has finished with, so it does not outlive the loop that registered
+// it. Without it a stopped consumer stays registered until its channel closes:
+// the queue keeps round-robining deliveries to it, and starting again with the
+// same tag on the same channel is answered with a connection-level 530
+// NOT_ALLOWED that takes down every publisher and consumer on the connection.
+//
+// basic.cancel is a synchronous call, so it takes its turn like the rest (see
+// rpcMu). It is skipped when the consumer is closing, where the channel close
+// that follows drops every registration on it anyway — no reason to spend a
+// round-trip on the common path.
+func (c *Consumer) cancelSubscription(ch *Channel, tag string) {
+	if ch == nil {
+		return
+	}
+
+	c.mu.RLock()
+	closing := c.closed
+	c.mu.RUnlock()
+	if closing || ch.ch.IsClosed() {
+		// Closing takes the channel with it, and a channel already gone took
+		// its registrations along.
+		return
+	}
+
+	if !c.acquireChannelSlot() {
+		c.log.Warnf("consumer: could not cancel subscription %q: the channel is still in use", tag)
+		c.markUncancelled(ch, tag)
+		return
+	}
+	err := ch.ch.Cancel(tag, false)
+	c.rpcMu.Unlock()
+
+	if err != nil {
+		c.log.Warnf("consumer: could not cancel subscription %q: %v", tag, err)
+		c.markUncancelled(ch, tag)
+	}
+}
+
+// markUncancelled records that tag is still registered on ch, so a Start that
+// would reuse it is refused rather than left to the broker. Only meaningful
+// while ch is still the consumer's channel and still open: either being false
+// means the registration is already gone.
+func (c *Consumer) markUncancelled(ch *Channel, tag string) {
+	if ch.ch.IsClosed() {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.channel == ch && !c.closed {
+		c.uncancelled = tag
+	}
 }
 
 // acquireChannelSlot takes rpcMu so a channel can be closed without colliding

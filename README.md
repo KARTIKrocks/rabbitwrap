@@ -429,6 +429,27 @@ A consumer consumes once: `Start` (and `Consume`) return `ErrAlreadyConsuming`
 if one is already running. Use `WithConcurrency` for parallel handlers, or a
 second consumer for a second subscription.
 
+`Stop()` unregisters the consumer at the broker, so a stopped consumer stops
+being counted and stops being routed to, and it can be started again:
+
+```go
+deliveries, _ := consumer.Start(ctx)
+consumer.Stop()             // unregistered at the broker
+deliveries, _ = consumer.Start(ctx) // registered again
+```
+
+Two things follow from that. Stopping costs one round-trip. And an auto-delete
+queue is deleted when its last consumer goes away, so stopping the only consumer
+of one deletes it — use a durable queue for anything a stopped consumer should
+come back to.
+
+By default each `Start` names its own subscription, which is what makes it
+cancellable: the broker will name one itself, but that name is never given back
+to the client. Set `WithConsumerTag` to choose the name shown in the management
+UI. A chosen name stays registered on the channel until it is cancelled, so if a
+cancel could not be sent the next `Start` returns `ErrConsumerTagInUse` rather
+than let the broker answer with a connection-level `530 NOT_ALLOWED`.
+
 ### Manual Message Handling
 
 ```go
