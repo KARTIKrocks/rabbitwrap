@@ -300,8 +300,18 @@ type Consumer struct {
 	mu          sync.RWMutex
 	closed      bool
 	// loops holds one handle per consume loop started by Start, so Stop and
-	// Close can both cancel them and wait for them to be gone.
-	loops       []consumeLoopHandle
+	// Close can both cancel them and wait for them to be gone. Start allows only
+	// one at a time; the slice exists so a loop that outlives the Stop which
+	// cancelled it is still tracked.
+	loops []consumeLoopHandle
+	// rpcMu serialises the synchronous AMQP calls this consumer issues on
+	// c.channel — the consume loop's basic.consume, the queue and exchange
+	// helpers, and the channel.close in Close. amqp091 does not serialise them
+	// itself: two calls outstanding on one channel both wait on the same rpc
+	// channel and either can be handed the other's reply, after which a
+	// channel.close never completes and its channel id is never released. Never
+	// held while c.mu is held.
+	rpcMu       sync.Mutex
 	reconnectCh chan struct{}
 	// chDeadCh carries "the current channel died" from the per-channel close
 	// watcher to the consume loop. Buffered and signalled non-blockingly, so
@@ -709,13 +719,25 @@ func (c *Consumer) Start(ctx context.Context) (<-chan *Delivery, error) {
 		return nil, ErrConsumeFailed
 	}
 
+	// One consume loop at a time. A second would issue its basic.consume on the
+	// same channel as the first, which is the hazard rpcMu exists to prevent —
+	// and rpcMu only orders those calls, it does not make two loops consuming
+	// the same queue on one channel a sensible thing to have. This also covers
+	// the case worth naming: a Start racing a Stop, or following one whose wait
+	// timed out, where the previous loop is cancelled but demonstrably still
+	// running. Use Concurrency for parallel handlers, or a second Consumer.
+	if running := runningLoops(c.loops); len(running) > 0 {
+		c.loops = running
+		return nil, ErrAlreadyConsuming
+	}
+
 	outCh := make(chan *Delivery)
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Register the loop before starting it, so a Stop or Close that follows
-	// cannot miss it, and drop the handles whose loops have already finished.
+	// cannot miss it.
 	done := make(chan struct{})
-	c.loops = append(runningLoops(c.loops), consumeLoopHandle{cancel: cancel, done: done})
+	c.loops = []consumeLoopHandle{{cancel: cancel, done: done}}
 
 	go func() {
 		defer close(done)
@@ -846,6 +868,9 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			continue
 		}
 
+		// basic.consume is synchronous, so it takes its turn on the channel
+		// like every other call this consumer makes (see rpcMu).
+		c.rpcMu.Lock()
 		deliveryCh, err := ch.ch.Consume(
 			queue,
 			c.config.ConsumerTag,
@@ -855,6 +880,7 @@ func (c *Consumer) consumeLoop(ctx context.Context, outCh chan<- *Delivery) {
 			c.config.NoWait,
 			amqp.Table(c.config.Args),
 		)
+		c.rpcMu.Unlock()
 		if err != nil {
 			c.log.Errorf("consumer: consume failed: %v, waiting for reconnect", err)
 			_ = ch.Close()
@@ -996,32 +1022,53 @@ func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, 
 	}
 }
 
+// withChannel runs one synchronous AMQP call on the consumer's channel, holding
+// rpcMu so it cannot overlap another — the consume loop's basic.consume
+// included. It refuses once the consumer is closed: Close may have left the
+// channel open because something was still using it (see ErrChannelBusy), and a
+// call issued on that channel is exactly what must not happen to it.
+//
+// c.mu is released before rpcMu is taken, so the consume loop — which needs
+// c.mu to read the channel — is never blocked behind a call waiting its turn.
+func (c *Consumer) withChannel(fn func(*Channel) error) error {
+	c.mu.RLock()
+	ch, closed := c.channel, c.closed
+	c.mu.RUnlock()
+	if closed {
+		return ErrShuttingDown
+	}
+	if ch == nil {
+		return ErrChannelClosed
+	}
+
+	c.rpcMu.Lock()
+	defer c.rpcMu.Unlock()
+	return fn(ch)
+}
+
 // DeclareQueue declares a queue.
 func (c *Consumer) DeclareQueue(name string, durable, autoDelete, exclusive bool, args map[string]any) (QueueInfo, error) {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return QueueInfo{}, ErrChannelClosed
-	}
-
-	q, err := ch.ch.QueueDeclare(
-		name,
-		durable,
-		autoDelete,
-		exclusive,
-		false, // no-wait
-		amqp.Table(args),
-	)
-	if err != nil {
-		return QueueInfo{}, err
-	}
-
-	return QueueInfo{
-		Name:      q.Name,
-		Messages:  q.Messages,
-		Consumers: q.Consumers,
-	}, nil
+	var info QueueInfo
+	err := c.withChannel(func(ch *Channel) error {
+		q, err := ch.ch.QueueDeclare(
+			name,
+			durable,
+			autoDelete,
+			exclusive,
+			false, // no-wait
+			amqp.Table(args),
+		)
+		if err != nil {
+			return err
+		}
+		info = QueueInfo{
+			Name:      q.Name,
+			Messages:  q.Messages,
+			Consumers: q.Consumers,
+		}
+		return nil
+	})
+	return info, err
 }
 
 // BindQueue binds a queue to an exchange on the consumer's channel.
@@ -1032,57 +1079,49 @@ func (c *Consumer) DeclareQueue(name string, durable, autoDelete, exclusive bool
 // WithBinding, which declare the exchange and apply the binding on every
 // channel setup and therefore also survive reconnects.
 func (c *Consumer) BindQueue(queue, exchange, routingKey string, args map[string]any) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.QueueBind(
-		queue,
-		routingKey,
-		exchange,
-		false, // no-wait
-		amqp.Table(args),
-	)
+	return c.withChannel(func(ch *Channel) error {
+		return ch.ch.QueueBind(
+			queue,
+			routingKey,
+			exchange,
+			false, // no-wait
+			amqp.Table(args),
+		)
+	})
 }
 
 // UnbindQueue unbinds a queue from an exchange.
 func (c *Consumer) UnbindQueue(queue, exchange, routingKey string, args map[string]any) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.QueueUnbind(
-		queue,
-		routingKey,
-		exchange,
-		amqp.Table(args),
-	)
+	return c.withChannel(func(ch *Channel) error {
+		return ch.ch.QueueUnbind(
+			queue,
+			routingKey,
+			exchange,
+			amqp.Table(args),
+		)
+	})
 }
 
 // PurgeQueue removes all messages from a queue.
 func (c *Consumer) PurgeQueue(queue string) (int, error) {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return 0, ErrChannelClosed
-	}
-	return ch.ch.QueuePurge(queue, false)
+	var purged int
+	err := c.withChannel(func(ch *Channel) error {
+		n, err := ch.ch.QueuePurge(queue, false)
+		purged = n
+		return err
+	})
+	return purged, err
 }
 
 // DeleteQueue deletes a queue.
 func (c *Consumer) DeleteQueue(queue string, ifUnused, ifEmpty bool) (int, error) {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return 0, ErrChannelClosed
-	}
-	return ch.ch.QueueDelete(queue, ifUnused, ifEmpty, false)
+	var deleted int
+	err := c.withChannel(func(ch *Channel) error {
+		n, err := ch.ch.QueueDelete(queue, ifUnused, ifEmpty, false)
+		deleted = n
+		return err
+	})
+	return deleted, err
 }
 
 // Stop stops consuming without closing the underlying channel. The topology
@@ -1128,10 +1167,11 @@ func (c *Consumer) Close() error {
 // break the whole connection (see awaitConsumeLoopsStopped). It is safe to call
 // Close immediately after Start.
 //
-// If a consume loop is still waiting on the broker after that, Close returns
-// ErrConsumeLoopStuck and deliberately leaves the channel open rather than
-// close one that is still in use; the connection reclaims it. The consumer is
-// closed regardless and delivers nothing further.
+// If a consume loop is still waiting on the broker after that, or a call on the
+// channel is still in flight, Close returns ErrChannelBusy and deliberately
+// leaves the channel open rather than close one that is still in use; the
+// connection reclaims it. The consumer is closed regardless, delivers nothing
+// further, and its queue and exchange methods stop accepting work.
 func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	c.mu.Lock()
 
@@ -1194,7 +1234,20 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 		// or the channel dies. The consumer is closed either way and delivers
 		// nothing further.
 		c.log.Errorf("consumer: leaving the channel open because a consume loop is still using it; it is released when the connection closes")
-		return ErrConsumeLoopStuck
+		return ErrChannelBusy
+	}
+
+	if ch != nil {
+		// channel.close is synchronous too, so it takes its turn like any other
+		// call. c.closed is already set, so no further call can join the queue
+		// for rpcMu; this only waits out one that was already in flight. If even
+		// that does not finish, the channel is left open for the same reason a
+		// stuck loop leaves it open.
+		if !c.acquireChannelForClose() {
+			c.log.Errorf("consumer: leaving the channel open because a call on it is still in flight; it is released when the connection closes")
+			return ErrChannelBusy
+		}
+		defer c.rpcMu.Unlock()
 	}
 
 	if ch != nil {
@@ -1259,6 +1312,23 @@ func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) bool {
 		}
 	}
 	return true
+}
+
+// acquireChannelForClose takes rpcMu so Close can close the channel without
+// colliding with a call already on it, giving up after consumeLoopStopTimeout
+// rather than letting an unresponsive broker hold Close open. It reports whether
+// the lock was taken; the caller must unlock it if so.
+func (c *Consumer) acquireChannelForClose() bool {
+	deadline := time.Now().Add(consumeLoopStopTimeout)
+	for {
+		if c.rpcMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by
@@ -1643,56 +1713,40 @@ func declareExchange(ch *Channel, ec ExchangeConfig) error {
 // exchange on every channel setup and so survives both a channel-level
 // exception and a reconnect.
 func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return declareExchange(ch, config)
+	return c.withChannel(func(ch *Channel) error {
+		return declareExchange(ch, config)
+	})
 }
 
 // DeleteExchange deletes an exchange.
 func (c *Consumer) DeleteExchange(name string, ifUnused bool) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.ExchangeDelete(name, ifUnused, false)
+	return c.withChannel(func(ch *Channel) error {
+		return ch.ch.ExchangeDelete(name, ifUnused, false)
+	})
 }
 
 // BindExchange binds an exchange to another exchange.
 func (c *Consumer) BindExchange(destination, source, routingKey string, args map[string]any) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.ExchangeBind(
-		destination,
-		routingKey,
-		source,
-		false, // no-wait
-		amqp.Table(args),
-	)
+	return c.withChannel(func(ch *Channel) error {
+		return ch.ch.ExchangeBind(
+			destination,
+			routingKey,
+			source,
+			false, // no-wait
+			amqp.Table(args),
+		)
+	})
 }
 
 // UnbindExchange unbinds an exchange from another exchange.
 func (c *Consumer) UnbindExchange(destination, source, routingKey string, args map[string]any) error {
-	c.mu.RLock()
-	ch := c.channel
-	c.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.ExchangeUnbind(
-		destination,
-		routingKey,
-		source,
-		false, // no-wait
-		amqp.Table(args),
-	)
+	return c.withChannel(func(ch *Channel) error {
+		return ch.ch.ExchangeUnbind(
+			destination,
+			routingKey,
+			source,
+			false, // no-wait
+			amqp.Table(args),
+		)
+	})
 }

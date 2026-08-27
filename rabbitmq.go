@@ -28,11 +28,19 @@ var (
 	ErrNack             = errors.New("rabbitmq: message was nacked")
 	ErrMaxReconnects    = errors.New("rabbitmq: max reconnection attempts reached")
 	ErrShuttingDown     = errors.New("rabbitmq: shutting down")
-	// ErrConsumeLoopStuck is returned by Consumer.Close when a consume loop did
-	// not stop in time, which leaves the channel it was consuming on unsafe to
-	// close. The consumer is closed and delivers nothing further; its channel is
+	// ErrChannelBusy is returned by Consumer.Close when something was still
+	// using the consumer's channel — a consume loop that did not stop in time,
+	// or an in-flight call on it — which leaves that channel unsafe to close.
+	// The consumer is closed and delivers nothing further; its channel is
 	// deliberately left open and is reclaimed when the connection closes.
-	ErrConsumeLoopStuck = errors.New("rabbitmq: consume loop did not stop; its channel was left open")
+	ErrChannelBusy = errors.New("rabbitmq: channel still in use; it was left open")
+	// ErrAlreadyConsuming is returned by Consumer.Start (and so by Consume) when
+	// the consumer already has a consume loop running. One consumer consumes
+	// once: a second loop would issue its basic.consume on the same channel as
+	// the first, and amqp091 does not serialise synchronous calls on a channel.
+	// Use ConsumerConfig.Concurrency for parallel handlers, or a second Consumer
+	// for a second subscription.
+	ErrAlreadyConsuming = errors.New("rabbitmq: consumer is already consuming")
 	// ErrNilConnection is returned by constructors when given a nil *Connection.
 	ErrNilConnection = errors.New("rabbitmq: nil connection")
 	// ErrNilMessage is returned by publish methods when given a nil *Message.

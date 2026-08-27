@@ -41,13 +41,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the consume loops is bounded, and on expiry `Close` used to close the
   channel anyway — doing the exact thing the wait exists to prevent, at the
   moment it is most likely to hurt, since a loop only fails to stop when the
-  broker has gone quiet. It now returns the new `ErrConsumeLoopStuck` and
+  broker has gone quiet. It now returns the new `ErrChannelBusy` and
   leaves that one channel open for the connection to reclaim. Losing a channel
   id until the connection closes is far cheaper than losing the connection every
   other publisher and consumer is sharing. The consumer is closed either way and
   delivers nothing further.
 
+- **Every synchronous call a consumer makes on its channel now takes its turn.**
+  The queue and exchange helpers (`DeclareQueue`, `BindQueue`, `PurgeQueue`,
+  `DeleteQueue`, `DeclareExchange`, `DeleteExchange`, `BindExchange`,
+  `UnbindExchange`, `UnbindQueue`) ran on the same channel as the consume loop,
+  so calling one while the loop was establishing its subscription hit the same
+  reply-mixing hazard. They are serialised with the loop's `basic.consume` and
+  with the `channel.close` in `Close`.
+
+  They also refuse, with `ErrShuttingDown`, once the consumer is closed. That
+  matters most when `Close` returned `ErrChannelBusy` and deliberately left the
+  channel open: it is still non-nil and would otherwise still accept calls —
+  issued on a channel that already has a request outstanding, which is the one
+  thing that must not happen to it.
+
 ### Changed
+
+- **A consumer consumes once.** `Start`, and so `Consume`, now returns the new
+  `ErrAlreadyConsuming` when a consume loop is already running instead of
+  starting a second one on the same channel. Two loops meant two `basic.consume`
+  calls on one channel, and the case that made it worth enforcing is a `Start`
+  racing a `Stop`, or following one whose wait timed out: the previous loop is
+  cancelled but still running, and cancelling it does nothing about the request
+  it already has on the wire. Use `WithConcurrency` for parallel handlers, or a
+  second consumer for a second subscription.
 
 - **`Consumer.Stop` returns once consumption has actually stopped**, rather than
   only having asked it to. It previously returned while the loop could still

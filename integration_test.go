@@ -1510,7 +1510,7 @@ func TestIntegration_ConsumerStopAndCloseConcurrently(t *testing.T) {
 // consumer is sharing. Leaving one channel open until the connection reclaims
 // it is the cheaper loss.
 //
-// A regression is caught by the ErrConsumeLoopStuck count, not by the health
+// A regression is caught by the ErrChannelBusy count, not by the health
 // checks that follow it: closing the channels anyway takes many more than
 // twenty rounds to exhaust a connection, which is exactly what made the
 // original bug so easy to miss. The health checks are here to pin the claim
@@ -1542,7 +1542,7 @@ func TestIntegration_ConsumerCloseGivesUpOnStuckLoop(t *testing.T) {
 		// Either outcome is legitimate — the loop may still win the race to
 		// exit — but each must leave the connection intact.
 		switch err := consumer.Close(); {
-		case errors.Is(err, ErrConsumeLoopStuck):
+		case errors.Is(err, ErrChannelBusy):
 			gaveUp++
 		case err != nil:
 			t.Fatalf("iteration %d: close: %v", i, err)
@@ -1560,6 +1560,109 @@ func TestIntegration_ConsumerCloseGivesUpOnStuckLoop(t *testing.T) {
 
 	if !conn.IsHealthy() {
 		t.Fatal("connection is no longer healthy after abandoning stuck consume loops")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerStartRefusesSecondLoop pins that a consumer consumes
+// once. A second loop would issue its basic.consume on the same channel as the
+// first, and two synchronous calls outstanding on one channel can be handed
+// each other's replies — so the second Start must be refused, not queued.
+//
+// The case that made this worth enforcing is a Start after a Stop whose wait
+// timed out: the previous loop is cancelled but demonstrably still running, and
+// nothing about the cancellation stops the request it has on the wire.
+func TestIntegration_ConsumerStartRefusesSecondLoop(t *testing.T) {
+	conn := integrationConn(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+
+	if _, err := consumer.Start(ctx); !errors.Is(err, ErrAlreadyConsuming) {
+		t.Fatalf("second Start = %v, want ErrAlreadyConsuming", err)
+	}
+	// Consume goes through Start, so it is refused on the same grounds.
+	if err := consumer.Consume(ctx, func(context.Context, *Delivery) error { return nil }); !errors.Is(err, ErrAlreadyConsuming) {
+		t.Fatalf("Consume while consuming = %v, want ErrAlreadyConsuming", err)
+	}
+
+	// Stopping releases the claim, so the consumer is restartable.
+	consumer.Stop()
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("Start after Stop: %v", err)
+	}
+}
+
+// TestIntegration_ConsumerHelpersRefusedAfterClose pins that the queue and
+// exchange helpers stop working once the consumer is closed.
+//
+// It matters most when Close left the channel open because something was still
+// using it (see ErrChannelBusy): the channel is still non-nil and would still
+// accept calls, and a call issued on it is exactly what must not happen to a
+// channel with a request already outstanding.
+func TestIntegration_ConsumerHelpersRefusedAfterClose(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost while calling helpers on a closed consumer: %v", err)
+	})
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+
+	// The helpers work while the consumer is open.
+	if _, err := consumer.PurgeQueue(queue); err != nil {
+		t.Fatalf("PurgeQueue on an open consumer: %v", err)
+	}
+
+	// Close with a loop still mid-basic.consume, so the channel is left open.
+	orig := consumeLoopStopTimeout
+	consumeLoopStopTimeout = time.Nanosecond
+	if _, err := consumer.Start(context.Background()); err != nil {
+		consumeLoopStopTimeout = orig
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+	closeErr := consumer.Close()
+	consumeLoopStopTimeout = orig
+	if closeErr != nil && !errors.Is(closeErr, ErrChannelBusy) {
+		t.Fatalf("close: %v", closeErr)
+	}
+	t.Logf("close returned %v", closeErr)
+
+	// Every helper must refuse, whether or not the channel was left open.
+	for name, call := range map[string]func() error{
+		"DeclareQueue": func() error { _, err := consumer.DeclareQueue(queue, true, true, false, nil); return err },
+		"BindQueue":    func() error { return consumer.BindQueue(queue, "amq.direct", "k", nil) },
+		"UnbindQueue":  func() error { return consumer.UnbindQueue(queue, "amq.direct", "k", nil) },
+		"PurgeQueue":   func() error { _, err := consumer.PurgeQueue(queue); return err },
+		"DeleteQueue":  func() error { _, err := consumer.DeleteQueue(queue, false, false); return err },
+		"DeclareExchange": func() error {
+			return consumer.DeclareExchange(DefaultExchangeConfig(queue+".ex", ExchangeDirect))
+		},
+		"DeleteExchange": func() error { return consumer.DeleteExchange(queue+".ex", false) },
+		"BindExchange":   func() error { return consumer.BindExchange("amq.fanout", "amq.direct", "k", nil) },
+		"UnbindExchange": func() error { return consumer.UnbindExchange("amq.fanout", "amq.direct", "k", nil) },
+	} {
+		if err := call(); !errors.Is(err, ErrShuttingDown) {
+			t.Errorf("%s on a closed consumer = %v, want ErrShuttingDown", name, err)
+		}
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
 	}
 	assertRoundTrip(t, conn)
 }
