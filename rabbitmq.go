@@ -93,6 +93,22 @@ var closeTimeout = 5 * time.Second
 // connection noticing the dead peer unblocks them and triggers the reconnect
 // they were heading for anyway. It is the Close methods, which promise the
 // caller they will return, that have to be bounded.
+//
+// On the timeout the goroutine is left running, which is the point of it: the
+// alternative to abandoning it is the hang. It is not a leak. done is buffered,
+// so the goroutine sends and exits the moment ch.Close() returns — when the
+// broker answers, or when the connection gives up on it — and there is one per
+// abandoned close, never more.
+//
+// It is worth being precise about what the abandoned close costs, because the
+// goroutine is easy to blame for it: the channel id stays taken until the
+// broker answers, but that is the protocol's doing, not the goroutine's.
+// channel.close has already gone out; amqp091 releases the id when the reply
+// lands, so the id comes back at exactly the same moment whether or not anyone
+// is still waiting. Not calling Close at all would hold it strictly longer.
+// Against a broker that heartbeats but will not answer channel.close, ids can
+// therefore accumulate — but nothing done here changes that, and the channel
+// the consumer or publisher was using is already lost either way.
 func closeChannelBounded(ch *Channel, log Logger, what string) error {
 	done := make(chan error, 1)
 	go func() { done <- ch.Close() }()

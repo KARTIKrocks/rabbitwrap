@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1955,6 +1956,62 @@ func TestIntegration_ConnectionCloseSurvivesUnresponsiveBroker(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close waited on an unresponsive broker instead of abandoning the connection")
+	}
+}
+
+// TestIntegration_AbandonedClosesDoNotLeakGoroutines pins that abandoning a
+// close costs one goroutine while it lasts and nothing afterwards.
+//
+// closeChannelBounded returns on its deadline and leaves the close running,
+// which is the point of it — the alternative is the hang. What must not happen
+// is those goroutines piling up: each one has to exit once the broker answers.
+func TestIntegration_AbandonedClosesDoNotLeakGoroutines(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+	conn := integrationConn(t)
+
+	origClose, origSlot := closeTimeout, channelSlotTimeout
+	closeTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeTimeout, channelSlotTimeout = origClose, origSlot })
+
+	// Measured before the consumers exist, not after. Closing them reaps their
+	// own goroutines, and that drop is large enough to hide the abandoned
+	// closes entirely if the baseline is taken with the consumers running —
+	// which made an earlier version of this test pass with a real leak in
+	// place. Everything created here should be gone by the end, so the count
+	// has to come back to where it started.
+	runtime.GC()
+	base := runtime.NumGoroutine()
+
+	const n = 10
+	consumers := make([]*Consumer, 0, n)
+	for i := range n {
+		c, err := NewConsumer(conn, DefaultConsumerConfig())
+		if err != nil {
+			t.Fatalf("failed to create consumer %d: %v", i, err)
+		}
+		consumers = append(consumers, c)
+	}
+
+	pauseBroker(t, container)
+	for _, c := range consumers {
+		_ = c.Close() // times out and abandons the close
+	}
+	unpauseBroker(t, container)
+
+	// Every abandoned close must finish and let its goroutine go. The slack is
+	// for goroutines this test has no say over, not for leaked closes: n of
+	// them would be well outside it.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		runtime.GC()
+		if runtime.NumGoroutine() <= base+2 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d goroutines still running, up from %d before %d consumers were created and closed",
+				runtime.NumGoroutine(), base, n)
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
