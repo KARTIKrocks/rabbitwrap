@@ -326,13 +326,21 @@ type Consumer struct {
 	// which takes its registrations with it.
 	uncancelled   string
 	uncancelledOn *Channel
+	// opsMu serialises the queue and exchange helpers on opsCh, the channel
+	// they run on. It is deliberately not c.channel: the helpers would
+	// otherwise depend on a channel only the consume loop re-establishes, so an
+	// idle consumer — one not consuming — kept a dead one for the rest of its
+	// life, and a failed declare took consumption down with it. Opened on first
+	// use and re-opened whenever it is found closed.
+	opsMu sync.Mutex
+	opsCh *Channel
 	// rpcMu serialises the synchronous AMQP calls this consumer issues on
-	// c.channel — the consume loop's basic.consume, the queue and exchange
-	// helpers, and the channel.close in Close. amqp091 does not serialise them
-	// itself: two calls outstanding on one channel both wait on the same rpc
-	// channel and either can be handed the other's reply, after which a
-	// channel.close never completes and its channel id is never released. Never
-	// held while c.mu is held.
+	// c.channel — the consume loop's basic.consume, its basic.cancel, and the
+	// channel.close in Close. amqp091 does not serialise them itself: two calls
+	// outstanding on one channel both wait on the same rpc channel and either
+	// can be handed the other's reply, after which a channel.close never
+	// completes and its channel id is never released. Never held while c.mu is
+	// held.
 	rpcMu       sync.Mutex
 	reconnectCh chan struct{}
 	// chDeadCh carries "the current channel died" from the per-channel close
@@ -1119,36 +1127,54 @@ func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, 
 	}
 }
 
-// withChannel runs one synchronous AMQP call on the consumer's channel, holding
-// rpcMu so it cannot overlap another — the consume loop's basic.consume
-// included. It refuses once the consumer is closed: Close may have left the
-// channel open because something was still using it (see ErrChannelBusy), and a
-// call issued on that channel is exactly what must not happen to it.
+// withChannel runs one synchronous AMQP call on the consumer's own channel for
+// queue and exchange work, opening it on first use and re-opening it whenever
+// it is found closed.
 //
-// The channel is read *after* rpcMu is taken, not before. Retiring a channel
-// also goes through rpcMu, so owning it first means the channel read here is
-// the current one and stays current for the whole call — where reading first
-// would let a replacement land in between and leave the call to run against a
-// channel that had since been closed.
+// The channel is deliberately not the one the consume loop uses. Sharing it
+// made these calls depend on a channel only that loop re-establishes, so a
+// consumer that was not consuming kept a dead channel for the rest of its life
+// — every call failing 504 while the connection itself was perfectly healthy.
+// It also meant a declaration the broker refuses, which closes the channel it
+// arrived on, took consumption down with it. On its own channel neither is
+// true: this one heals on the next call, and consumption never notices.
 //
-// This is the only place that holds rpcMu and c.mu at once, and it takes them
-// in that order. Nothing acquires rpcMu while holding c.mu — every close site
-// releases c.mu first — so the pair cannot deadlock.
+// opsMu serialises the calls, so re-opening cannot race one already in flight
+// and only one call is ever outstanding on the channel — amqp091 does not
+// serialise synchronous calls itself, and two on one channel can be handed each
+// other's replies.
 func (c *Consumer) withChannel(fn func(*Channel) error) error {
-	c.rpcMu.Lock()
-	defer c.rpcMu.Unlock()
+	c.opsMu.Lock()
+	defer c.opsMu.Unlock()
 
+	// Under opsMu, not before it. Close takes opsMu to close this channel, so
+	// checking outside would leave a window where a call passes the check,
+	// Close runs to completion, and the call then opens a fresh channel on a
+	// closed consumer — one that works, which it must not, and that nothing is
+	// left to close.
 	c.mu.RLock()
-	ch, closed := c.channel, c.closed
+	closed := c.closed
 	c.mu.RUnlock()
 	if closed {
 		return ErrShuttingDown
 	}
-	if ch == nil {
-		return ErrChannelClosed
+
+	if c.opsCh != nil && c.opsCh.ch.IsClosed() {
+		// Already gone — the broker closed it under a refused declaration, or
+		// the connection went. Its id was released by whatever closed it, and
+		// amqp091's Close returns immediately on an already-closed channel, so
+		// there is nothing to close here: just drop it and open a fresh one.
+		c.opsCh = nil
+	}
+	if c.opsCh == nil {
+		ch, err := c.conn.Channel()
+		if err != nil {
+			return err
+		}
+		c.opsCh = ch
 	}
 
-	return fn(ch)
+	return fn(c.opsCh)
 }
 
 // DeclareQueue declares a queue.
@@ -1176,13 +1202,15 @@ func (c *Consumer) DeclareQueue(name string, durable, autoDelete, exclusive bool
 	return info, err
 }
 
-// BindQueue binds a queue to an exchange on the consumer's channel.
+// BindQueue binds a queue to an exchange.
 //
 // Binding to an exchange that does not exist fails with NOT_FOUND, and the
-// broker closes the underlying channel — so a failed bind also interrupts
-// consumption, and the binding is not retried. Prefer WithExchangeConfig plus
-// WithBinding, which declare the exchange and apply the binding on every
-// channel setup and therefore also survive reconnects.
+// broker closes the channel the bind arrived on — which is the consumer's own
+// queue-and-exchange channel, not the one it consumes on, so consumption is
+// unaffected and the next call opens a fresh one. The binding is not retried,
+// so prefer WithExchangeConfig plus WithBinding, which declare the exchange and
+// apply the binding on every channel setup and therefore also survive
+// reconnects.
 func (c *Consumer) BindQueue(queue, exchange, routingKey string, args map[string]any) error {
 	return c.withChannel(func(ch *Channel) error {
 		return ch.ch.QueueBind(
@@ -1267,11 +1295,16 @@ func (c *Consumer) Close() error {
 // complete, the consumer closes immediately.
 //
 // The context bounds the waits that exist for the caller's benefit — draining
-// in-flight handlers and stopping the topology refresh. Close still waits
-// briefly for the consume loops to leave the channel alone, whatever the
-// context says, because closing a channel with a request outstanding on it can
-// break the whole connection (see awaitConsumeLoopsStopped). It is safe to call
-// Close immediately after Start.
+// in-flight handlers and stopping the topology refresh. The rest are not the
+// caller's to trade away, because they protect a connection shared with
+// unrelated publishers and consumers: waiting for the consume loops to leave
+// the channel alone, and closing each of the consumer's two channels without a
+// request still outstanding on it (see awaitConsumeLoopsStopped). It is safe to
+// call Close immediately after Start.
+//
+// Each of those has its own cap of a few seconds and they are additive, so
+// against a broker that has stopped answering entirely Close can take some
+// tens of seconds whatever the context says. It always returns.
 //
 // If a consume loop is still waiting on the broker after that, or a call on the
 // channel is still in flight, Close returns ErrChannelBusy and deliberately
@@ -1321,6 +1354,8 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 		}
 	}
 
+	c.closeOpsChannel()
+
 	c.mu.RLock()
 	ch := c.channel
 	c.mu.RUnlock()
@@ -1357,16 +1392,7 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	}
 
 	if ch != nil {
-		// Use a goroutine to avoid hanging on a broken channel close.
-		done := make(chan error, 1)
-		go func() { done <- ch.Close() }()
-		select {
-		case err := <-done:
-			return err
-		case <-time.After(5 * time.Second):
-			c.log.Warnf("consumer: channel close timed out")
-			return nil
-		}
+		return closeChannelBounded(ch, c.log, "consumer: channel")
 	}
 	return nil
 }
@@ -1460,6 +1486,34 @@ func (c *Consumer) cancelSubscription(ch *Channel, tag string) {
 		return
 	}
 	c.clearUncancelled(ch, tag)
+}
+
+// closeOpsChannel closes the channel the queue and exchange helpers run on, if
+// one was ever opened. c.closed is already set, so no further call can take
+// opsMu; this only waits out one already in flight.
+//
+// Both waits here are bounded — for opsMu, and then for the close itself — so
+// an unresponsive broker cannot hold Close open at either step. An abandoned
+// channel is released when the connection closes.
+func (c *Consumer) closeOpsChannel() {
+	if !acquireSlot(&c.opsMu) {
+		c.log.Warnf("consumer: leaving the queue/exchange channel open because a call on it is still in flight; it is released when the connection closes")
+		return
+	}
+	defer c.opsMu.Unlock()
+
+	if c.opsCh != nil {
+		// Bounded for the same reason the consume channel's close is: this runs
+		// inside Close, which has to return.
+		if err := closeChannelBounded(c.opsCh, c.log, "consumer: queue/exchange channel"); err != nil {
+			// Not returned: Close already reports on the consume channel, and a
+			// failure here does not change what the caller should do. Worth
+			// saying, though — it is the only sign the channel was not released
+			// cleanly.
+			c.log.Warnf("consumer: closing the queue/exchange channel: %v", err)
+		}
+		c.opsCh = nil
+	}
 }
 
 // retryPendingCancel gives an outstanding basic.cancel another attempt. It is a
@@ -1889,14 +1943,14 @@ func declareExchange(ch *Channel, ec ExchangeConfig) error {
 	)
 }
 
-// DeclareExchange declares an exchange on the consumer's channel.
+// DeclareExchange declares an exchange.
 //
 // A failed declaration (for example a type mismatch with an existing exchange)
-// closes the underlying channel, taking any in-flight consumption with it. A
-// running consume loop re-establishes the channel, but the exchange declared
-// here is not re-applied — so prefer WithExchangeConfig, which declares the
-// exchange on every channel setup and so survives both a channel-level
-// exception and a reconnect.
+// closes the channel it arrived on, which is the consumer's own
+// queue-and-exchange channel rather than the one it consumes on: consumption is
+// unaffected and the next call opens a fresh one. The exchange declared here is
+// not re-applied after a reconnect, so prefer WithExchangeConfig, which
+// declares it on every channel setup.
 func (c *Consumer) DeclareExchange(config ExchangeConfig) error {
 	return c.withChannel(func(ch *Channel) error {
 		return declareExchange(ch, config)
