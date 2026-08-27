@@ -335,12 +335,12 @@ type Consumer struct {
 	opsMu sync.Mutex
 	opsCh *Channel
 	// rpcMu serialises the synchronous AMQP calls this consumer issues on
-	// c.channel — the consume loop's basic.consume and the channel.close in
-	// Close. amqp091 does not serialise them
-	// itself: two calls outstanding on one channel both wait on the same rpc
-	// channel and either can be handed the other's reply, after which a
-	// channel.close never completes and its channel id is never released. Never
-	// held while c.mu is held.
+	// c.channel — the consume loop's basic.consume, its basic.cancel, and the
+	// channel.close in Close. amqp091 does not serialise them itself: two calls
+	// outstanding on one channel both wait on the same rpc channel and either
+	// can be handed the other's reply, after which a channel.close never
+	// completes and its channel id is never released. Never held while c.mu is
+	// held.
 	rpcMu       sync.Mutex
 	reconnectCh chan struct{}
 	// chDeadCh carries "the current channel died" from the per-channel close
@@ -1144,15 +1144,20 @@ func (c *Consumer) processDelivery(ctx context.Context, handler MessageHandler, 
 // serialise synchronous calls itself, and two on one channel can be handed each
 // other's replies.
 func (c *Consumer) withChannel(fn func(*Channel) error) error {
+	c.opsMu.Lock()
+	defer c.opsMu.Unlock()
+
+	// Under opsMu, not before it. Close takes opsMu to close this channel, so
+	// checking outside would leave a window where a call passes the check,
+	// Close runs to completion, and the call then opens a fresh channel on a
+	// closed consumer — one that works, which it must not, and that nothing is
+	// left to close.
 	c.mu.RLock()
 	closed := c.closed
 	c.mu.RUnlock()
 	if closed {
 		return ErrShuttingDown
 	}
-
-	c.opsMu.Lock()
-	defer c.opsMu.Unlock()
 
 	if c.opsCh != nil && c.opsCh.ch.IsClosed() {
 		// Already gone — the broker closed it under a refused declaration, or

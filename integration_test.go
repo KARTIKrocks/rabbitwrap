@@ -1789,6 +1789,61 @@ func TestIntegration_IdleConsumerHelpersRecover(t *testing.T) {
 	}
 }
 
+// TestIntegration_ConsumerHelperRefusedWhenCloseRacesIt forces the interleaving
+// where a queue or exchange call is already under way when Close runs.
+//
+// The call must not open itself a fresh channel on the far side of that: it
+// would succeed on a closed consumer, which the contract says cannot happen,
+// and nothing would be left to close what it opened — the channel would sit
+// there until the connection went.
+func TestIntegration_ConsumerHelperRefusedWhenCloseRacesIt(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
+
+	// Park a call on opsMu, past the point where it would have checked whether
+	// the consumer was closed if that check came first.
+	consumer.opsMu.Lock()
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := consumer.PurgeQueue(queue)
+		callErr <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// Let Close run all the way through while the call is parked.
+	origSlot := channelSlotTimeout
+	channelSlotTimeout = 50 * time.Millisecond
+	closeErr := consumer.Close()
+	channelSlotTimeout = origSlot
+	if closeErr != nil {
+		t.Fatalf("close: %v", closeErr)
+	}
+
+	consumer.opsMu.Unlock()
+
+	if err := <-callErr; !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("call resumed after Close = %v, want ErrShuttingDown", err)
+	}
+
+	consumer.opsMu.Lock()
+	left := consumer.opsCh
+	consumer.opsMu.Unlock()
+	if left != nil && !left.ch.IsClosed() {
+		t.Error("the call opened a channel on a closed consumer; nothing is left to close it")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+}
+
 // TestIntegration_ConsumerHelperFailureSparesConsumption pins the isolation the
 // separate channel buys. A declaration the broker refuses is answered by
 // closing the channel it arrived on; when that was the channel being consumed

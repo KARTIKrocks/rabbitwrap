@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Queue and exchange calls report a down connection as `ErrNotConnected`**
+  rather than `ErrChannelClosed`. They now open their channel on demand, so a
+  connection that is not there is what the failure actually is.
+
 - **A refused declaration no longer interrupts consumption.** The broker answers
   one by closing the channel it arrived on; since that was the channel being
   consumed on, a single bad `BindQueue` or `DeclareExchange` also stopped
