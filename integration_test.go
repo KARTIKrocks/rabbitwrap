@@ -1499,6 +1499,71 @@ func TestIntegration_ConsumerStopAndCloseConcurrently(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
+// TestIntegration_ConsumerCloseGivesUpOnStuckLoop drives Close down the path it
+// takes when a consume loop will not stop in time, by shortening the wait until
+// it expires against a loop that is genuinely mid-basic.consume.
+//
+// The point is what Close does next. It must not close that channel — the
+// outstanding request and the channel.close can take each other's replies,
+// after which the close never completes and the channel id is never released,
+// and enough abandoned ids bring down the connection every other publisher and
+// consumer is sharing. Leaving one channel open until the connection reclaims
+// it is the cheaper loss.
+//
+// A regression is caught by the ErrConsumeLoopStuck count, not by the health
+// checks that follow it: closing the channels anyway takes many more than
+// twenty rounds to exhaust a connection, which is exactly what made the
+// original bug so easy to miss. The health checks are here to pin the claim
+// that the path this test drives Close down is the harmless one.
+func TestIntegration_ConsumerCloseGivesUpOnStuckLoop(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost while abandoning stuck consume loops: %v", err)
+	})
+
+	orig := consumeLoopStopTimeout
+	consumeLoopStopTimeout = time.Nanosecond // expires before any loop can exit
+	t.Cleanup(func() { consumeLoopStopTimeout = orig })
+
+	var gaveUp int
+	for i := range 20 {
+		consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := consumer.Start(ctx); err != nil {
+			cancel()
+			consumer.Close()
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// Either outcome is legitimate — the loop may still win the race to
+		// exit — but each must leave the connection intact.
+		switch err := consumer.Close(); {
+		case errors.Is(err, ErrConsumeLoopStuck):
+			gaveUp++
+		case err != nil:
+			t.Fatalf("iteration %d: close: %v", i, err)
+		}
+		if !consumer.IsClosed() {
+			t.Fatalf("iteration %d: consumer must be closed even when its channel is left open", i)
+		}
+		cancel()
+	}
+
+	if gaveUp == 0 {
+		t.Fatal("no Close hit the stuck-loop path; the test proved nothing")
+	}
+	t.Logf("Close abandoned the channel in %d of 20 iterations", gaveUp)
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after abandoning stuck consume loops")
+	}
+	assertRoundTrip(t, conn)
+}
+
 // assertRoundTrip publishes a message on conn and requires a consumer on the
 // same connection to receive it, proving the connection is still fully usable.
 func assertRoundTrip(t *testing.T, conn *Connection) {

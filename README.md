@@ -419,6 +419,10 @@ The deadline covers draining in-flight handlers. Close always takes the moment
 it needs to stop consuming first, however tight the deadline, because closing a
 channel with a request still outstanding on it can break the whole connection —
 so closing a consumer is safe at any point, including immediately after `Start`.
+If consuming cannot be stopped because the broker has gone quiet, Close returns
+`ErrConsumeLoopStuck` and leaves that one channel open for the connection to
+reclaim, rather than close a channel still in use and risk the connection with
+it. The consumer is closed either way.
 
 ### Manual Message Handling
 

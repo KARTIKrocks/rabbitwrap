@@ -1094,7 +1094,10 @@ func (c *Consumer) DeleteQueue(queue string, ifUnused, ifEmpty bool) (int, error
 // they have been asked to: a request one of them still has outstanding must not
 // be left to race whatever touches the channel next — including the
 // basic.consume of a Start that follows (see awaitConsumeLoopsStopped). The
-// wait is normally immediate and is bounded by consumeLoopStopTimeout.
+// wait is normally immediate and is bounded by consumeLoopStopTimeout; if it is
+// ever hit, a loop is still waiting on the broker and a Start issued before it
+// returns would race the request it has outstanding. The timeout is logged, so
+// treat it as a reason to close the consumer rather than restart it.
 //
 // Stopping does not cancel the subscription at the broker, which happens only
 // when the channel is closed, so every Start after a Stop adds another consumer
@@ -1124,6 +1127,11 @@ func (c *Consumer) Close() error {
 // context says, because closing a channel with a request outstanding on it can
 // break the whole connection (see awaitConsumeLoopsStopped). It is safe to call
 // Close immediately after Start.
+//
+// If a consume loop is still waiting on the broker after that, Close returns
+// ErrConsumeLoopStuck and deliberately leaves the channel open rather than
+// close one that is still in use; the connection reclaims it. The consumer is
+// closed regardless and delivers nothing further.
 func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	c.mu.Lock()
 
@@ -1150,7 +1158,7 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 
 	// Then stop consuming, so nothing is on the wire when the channel is closed
 	// below and no further deliveries reach the handlers drained after this.
-	c.awaitConsumeLoopsStopped(loops)
+	stopped := c.awaitConsumeLoopsStopped(loops)
 
 	// Wait for in-flight handlers if graceful shutdown is enabled
 	if c.config.GracefulShutdown {
@@ -1170,6 +1178,24 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 	c.mu.RLock()
 	ch := c.channel
 	c.mu.RUnlock()
+
+	if !stopped {
+		// A loop is still waiting on a reply from the broker. Closing its
+		// channel now is precisely what awaitConsumeLoopsStopped exists to
+		// prevent, and the damage would not stop at this consumer: the
+		// channel.close and the outstanding request can take each other's
+		// replies, after which the close never completes, the channel id is
+		// never released, and enough abandoned ids bring down the connection
+		// every other publisher and consumer is sharing.
+		//
+		// So leave the channel open. It costs one channel id until the
+		// connection closes and reclaims it, which is the lesser loss by a wide
+		// margin — and the loop returns on its own as soon as the broker answers
+		// or the channel dies. The consumer is closed either way and delivers
+		// nothing further.
+		c.log.Errorf("consumer: leaving the channel open because a consume loop is still using it; it is released when the connection closes")
+		return ErrConsumeLoopStuck
+	}
 
 	if ch != nil {
 		// Use a goroutine to avoid hanging on a broken channel close.
@@ -1191,8 +1217,8 @@ func (c *Consumer) CloseWithContext(ctx context.Context) error {
 const refreshStopTimeout = 5 * time.Second
 
 // consumeLoopStopTimeout bounds the total time Stop and Close wait for the
-// consume loops they cancelled to exit.
-const consumeLoopStopTimeout = 5 * time.Second
+// consume loops they cancelled to exit. A variable so tests can shorten it.
+var consumeLoopStopTimeout = 5 * time.Second
 
 // awaitConsumeLoopsStopped waits for already-cancelled consume loops to return,
 // so that nothing else touches the channel they consume on while one of their
@@ -1211,9 +1237,14 @@ const consumeLoopStopTimeout = 5 * time.Second
 // away for a faster shutdown, and consumeLoopStopTimeout — which bounds the
 // whole set, not each loop — already caps it. It normally costs nothing, since
 // the loops leave on the cancellation the caller has already issued.
-func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) {
+//
+// It reports whether every loop stopped. False means a loop is still blocked on
+// a request to the broker, and the caller must not close the channel: doing so
+// is the very hazard described above, and callers that cannot honour that must
+// leave the channel alone instead.
+func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) bool {
 	if len(loops) == 0 {
-		return
+		return true
 	}
 
 	timeout := time.NewTimer(consumeLoopStopTimeout)
@@ -1223,10 +1254,11 @@ func (c *Consumer) awaitConsumeLoopsStopped(loops []consumeLoopHandle) {
 		select {
 		case <-l.done:
 		case <-timeout.C:
-			c.log.Warnf("consumer: consume loop did not stop in time")
-			return
+			c.log.Warnf("consumer: consume loop did not stop within %s; it still has a request outstanding on its channel", consumeLoopStopTimeout)
+			return false
 		}
 	}
+	return true
 }
 
 // awaitTopologyRefreshStopped waits for the refresh loop to return: bounded by

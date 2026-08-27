@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was enough to avoid it — so consumers that run for any length of time were
   never at risk. Tests and short-lived consumers were.
 
+- **`Consumer.Close` no longer closes a channel it could not quiet.** The wait
+  for the consume loops is bounded, and on expiry `Close` used to close the
+  channel anyway — doing the exact thing the wait exists to prevent, at the
+  moment it is most likely to hurt, since a loop only fails to stop when the
+  broker has gone quiet. It now returns the new `ErrConsumeLoopStuck` and
+  leaves that one channel open for the connection to reclaim. Losing a channel
+  id until the connection closes is far cheaper than losing the connection every
+  other publisher and consumer is sharing. The consumer is closed either way and
+  delivers nothing further.
+
 ### Changed
 
 - **`Consumer.Stop` returns once consumption has actually stopped**, rather than
