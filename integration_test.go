@@ -1737,73 +1737,130 @@ func TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
-// TestIntegration_ConsumerCallUsesTheChannelItWaitedFor pins the other half of
-// the ordering: a call must pick its channel *after* it owns rpcMu, not before.
+// TestIntegration_IdleConsumerHelpersRecover covers a consumer that is not
+// consuming — one that never started, or was stopped.
 //
-// Reading first leaves a window — the call captures the current channel, then
-// waits for the lock, and a replacement lands in between — after which the call
-// runs against a channel that has since been retired and fails for no reason
-// the caller could have avoided.
-//
-// The replacement here is done by hand rather than by racing setupChannel, so
-// the interleaving is forced instead of hoped for: the call is parked on the
-// lock while the channel it would have captured is swapped out and closed.
-func TestIntegration_ConsumerCallUsesTheChannelItWaitedFor(t *testing.T) {
-	conn := integrationConn(t)
+// Its queue and exchange calls used to run on the channel the consume loop
+// owns, and only that loop ever re-establishes it. So anything that killed the
+// channel left every later call failing 504 for the rest of the consumer's
+// life, while the connection itself stayed perfectly healthy: nothing looked
+// broken, and nothing recovered. Both ways of killing it are covered, since the
+// consumer sees neither.
+func TestIntegration_IdleConsumerHelpersRecover(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kill func(t *testing.T, conn *Connection, c *Consumer, queue string)
+	}{
+		{"channel-level exception", func(t *testing.T, _ *Connection, c *Consumer, queue string) {
+			// NOT_FOUND on a missing exchange; the broker closes the channel.
+			if err := c.BindQueue(queue, "exchange-that-does-not-exist", "k", nil); err == nil {
+				t.Fatal("expected binding to a missing exchange to fail")
+			}
+		}},
+		{"connection loss", func(t *testing.T, conn *Connection, _ *Consumer, _ string) {
+			if err := underlyingConn(conn).Close(); err != nil {
+				t.Fatalf("close underlying connection: %v", err)
+			}
+			waitForReconnected(t, conn)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := integrationConn(t)
+			queue := uniqueQueue(t)
+			consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+				WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+			if err != nil {
+				t.Fatalf("failed to create consumer: %v", err)
+			}
+			t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
 
+			if _, err := consumer.PurgeQueue(queue); err != nil {
+				t.Fatalf("purge while healthy: %v", err)
+			}
+
+			tc.kill(t, conn, consumer, queue)
+
+			// The very next call must work: the channel is re-opened on demand,
+			// with no consume loop anywhere to do it.
+			if _, err := consumer.PurgeQueue(queue); err != nil {
+				t.Fatalf("purge after the channel was killed: %v", err)
+			}
+		})
+	}
+}
+
+// TestIntegration_ConsumerHelperFailureSparesConsumption pins the isolation the
+// separate channel buys. A declaration the broker refuses is answered by
+// closing the channel it arrived on; when that was the channel being consumed
+// on, a single bad call also stopped consumption and dropped whatever was
+// unacknowledged on it.
+func TestIntegration_ConsumerHelperFailureSparesConsumption(t *testing.T) {
+	conn := integrationConn(t)
 	queue := uniqueQueue(t)
+
 	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
-		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
 	if err != nil {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
-	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+	if err := pub.PublishText(ctx, "before"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
 
 	consumer.mu.RLock()
-	old := consumer.channel
+	consuming := consumer.channel
 	consumer.mu.RUnlock()
 
-	consumer.rpcMu.Lock()
-
-	// Parks on rpcMu. What it must not do is decide which channel to use before
-	// getting there.
-	callErr := make(chan error, 1)
-	go func() {
-		_, err := consumer.PurgeQueue(queue)
-		callErr <- err
-	}()
-	time.Sleep(200 * time.Millisecond) // let it reach the lock
-
-	// Exactly what setupChannel does while a call waits: install the
-	// replacement, then retire the channel it replaced.
-	fresh, err := conn.Channel()
-	if err != nil {
-		consumer.rpcMu.Unlock()
-		t.Fatalf("open replacement channel: %v", err)
-	}
-	consumer.mu.Lock()
-	consumer.channel = fresh
-	consumer.mu.Unlock()
-	if err := old.Close(); err != nil {
-		consumer.rpcMu.Unlock()
-		t.Fatalf("close the replaced channel: %v", err)
-	}
-
-	consumer.rpcMu.Unlock()
-
-	select {
-	case err := <-callErr:
-		if err != nil {
-			t.Fatalf("call failed against a channel retired while it waited: %v", err)
+	// Several refusals, so this cannot pass on the strength of one that raced.
+	for i := range 3 {
+		if err := consumer.BindQueue(queue, "exchange-that-does-not-exist", "k", nil); err == nil {
+			t.Fatalf("refusal %d: expected binding to a missing exchange to fail", i)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the call never returned")
 	}
 
-	if !conn.IsHealthy() {
-		t.Fatal("connection is no longer healthy")
+	consumer.mu.RLock()
+	stillConsuming := consumer.channel
+	consumer.mu.RUnlock()
+	if stillConsuming != consuming {
+		t.Error("the consume channel was replaced, so a refused declaration reached it")
 	}
-	assertRoundTrip(t, conn)
+	if consuming.ch.IsClosed() {
+		t.Error("the consume channel was closed by a refused declaration")
+	}
+
+	// The real check: it is still delivering, without having had to recover.
+	if err := pub.PublishText(ctx, "after"); err != nil {
+		t.Fatalf("publish after the refusals: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "after")
+}
+
+// waitForReconnected waits for the connection to come back after a drop.
+func waitForReconnected(t *testing.T, conn *Connection) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !conn.IsHealthy() {
+		if time.Now().After(deadline) {
+			t.Fatal("connection never came back after being dropped")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // TestIntegration_PublisherReplacedChannelWaitsForCallInFlight is the publisher

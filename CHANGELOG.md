@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-08-27
+
+### Fixed
+
+- **A consumer that is not consuming now recovers its channel.** The queue and
+  exchange helpers (`DeclareQueue`, `BindQueue`, `PurgeQueue`, `DeleteQueue`,
+  `DeclareExchange`, `DeleteExchange`, `BindExchange`, `UnbindExchange`,
+  `UnbindQueue`) ran on the channel the consume loop owns, and only that loop
+  ever re-establishes it. A consumer that had never called `Start`, or had been
+  stopped, therefore kept a dead channel for the rest of its life: every call
+  failed with `504 channel/connection is not open` while `IsHealthy()` reported
+  the connection fine. Nothing looked broken and nothing recovered — verified
+  for twelve seconds after both a channel-level exception and a full connection
+  loss, with no sign of it ever coming back.
+
+  The helpers now run on a channel of the consumer's own, opened on first use
+  and re-opened whenever it is found closed. The next call after a channel dies
+  simply works, with no consume loop anywhere to do it.
+
+### Changed
+
+- **A refused declaration no longer interrupts consumption.** The broker answers
+  one by closing the channel it arrived on; since that was the channel being
+  consumed on, a single bad `BindQueue` or `DeclareExchange` also stopped
+  delivery and dropped whatever was unacknowledged on it. On its own channel it
+  costs nothing but the call. This is the same isolation the topology refresh
+  has had since 0.13.0, for the same reason.
+
 ## [0.15.0] - 2026-08-27
 
 ### Fixed
