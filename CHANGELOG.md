@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-08-27
+
+### Fixed
+
+- **Stopping a consumer now unregisters it at the broker.** `Stop` cancelled the
+  consume loop but never sent `basic.cancel`, so the subscription stayed
+  registered until the channel closed. The queue went on counting the consumer
+  and round-robining messages to it, with nothing reading them — the consumer
+  count climbed 1, 2, 3, 4 across four stop/start cycles and only came down when
+  the consumer was closed.
+
+  With a configured `WithConsumerTag` it was worse than a leak. A tag stays
+  registered on its channel until cancelled, so starting again with it was
+  answered with `530 NOT_ALLOWED — attempt to reuse consumer tag`, which is a
+  **connection-level** exception: it took down every publisher and consumer
+  sharing the connection, not just the consumer being restarted.
+
+  The consume loop now cancels its subscription when it stops. Stopping and
+  starting the same consumer works, and the queue's consumer count returns to
+  zero on every `Stop`.
+
+### Changed
+
+- **A consumer names its own subscription.** The broker will name one itself,
+  but amqp091 never hands that name back, and a subscription whose name is
+  unknown cannot be cancelled — which is why this had to change before the fix
+  above was possible. With `ConsumerTag` unset, each `Start` generates a
+  `rabbitwrap-<random>` name; consumer tags in the management UI change
+  accordingly. Setting `WithConsumerTag` still uses exactly that name.
+
+- **`Consumer.Stop` costs a round-trip**, where before it was local-only. It is
+  still bounded by the same 5s cap.
+
+- **Stopping the only consumer of an auto-delete queue now deletes the queue**,
+  which is what auto-delete means — the missing cancel was hiding it. Use a
+  durable queue for anything a stopped consumer should come back to.
+
+- **`Start` retries an outstanding cancel, and returns the new
+  `ErrConsumerTagInUse`** if even that cannot get through — rather than letting
+  the broker answer with the connection-level 530 described above. The retry
+  matters because nothing else re-establishes a consumer's channel: that is the
+  consume loop's job, and the case this arises in is precisely the one with no
+  loop running, so a single failed cancel would otherwise refuse every `Start`
+  for the rest of the consumer's life.
+
 ## [0.14.0] - 2026-08-25
 
 ### Fixed
