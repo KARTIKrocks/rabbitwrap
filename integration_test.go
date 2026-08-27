@@ -1300,6 +1300,669 @@ func TestIntegration_ConsumerClose(t *testing.T) {
 	}
 }
 
+// TestIntegration_ConsumerCloseImmediatelyAfterStart closes consumers inside the
+// window where the consume loop still has its basic.consume on the wire.
+//
+// amqp091 does not serialise synchronous calls on a channel, so a channel.close
+// sent while a request is outstanding can be answered with that request's reply
+// and vice versa: Close blocks until the connection dies and the channel id is
+// never released. Enough abandoned ids earn a connection-level exception, which
+// takes down every other publisher and consumer on the shared connection — so
+// the assertions are about the *connection*, not just about these consumers.
+//
+// Before the fix this reproduced within ~60 cycles: Close after Close hitting
+// its 5s timeout, then a 504 CHANNEL_ERROR that left the connection unusable.
+func TestIntegration_ConsumerCloseImmediatelyAfterStart(t *testing.T) {
+	conn := integrationConn(t)
+
+	var disconnects atomic.Int32
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during create/Start/Close cycles: %v", err)
+		disconnects.Add(1)
+	})
+
+	// Both entry points spawn the consume loop; Consume adds handler goroutines
+	// that Close also has to unwind.
+	for _, start := range []struct {
+		name string
+		run  func(*Consumer, context.Context) error
+	}{
+		{"Start", func(c *Consumer, ctx context.Context) error {
+			_, err := c.Start(ctx)
+			return err
+		}},
+		{"Consume", func(c *Consumer, ctx context.Context) error {
+			go c.Consume(ctx, func(context.Context, *Delivery) error { return nil })
+			return nil
+		}},
+	} {
+		t.Run(start.name, func(t *testing.T) {
+			for i := range 30 {
+				// A server-named queue declares nothing, so no topology refresh
+				// runs and the consume loop is the only thing Close waits for.
+				consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+				if err != nil {
+					t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				if err := start.run(consumer, ctx); err != nil {
+					cancel()
+					consumer.Close()
+					t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+				}
+
+				// No delay: closing here is the whole point of the test.
+				began := time.Now()
+				if err := consumer.Close(); err != nil {
+					t.Fatalf("iteration %d: close: %v", i, err)
+				}
+				if took := time.Since(began); took > 2*time.Second {
+					t.Fatalf("iteration %d: close took %s, expected it not to wait out a timeout", i, took)
+				}
+				cancel()
+
+				if disconnects.Load() != 0 {
+					t.FailNow() // OnDisconnect already reported it
+				}
+			}
+		})
+	}
+
+	// The connection must still be usable by everything else sharing it.
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the create/Start/Close cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerStopThenStart restarts a consumer with no delay after
+// stopping it, which is only safe if Stop leaves the consume loop gone rather
+// than merely cancelled: the next Start issues its basic.consume on the same
+// channel, and two synchronous requests outstanding on one channel can be
+// handed each other's replies — see
+// TestIntegration_ConsumerCloseImmediatelyAfterStart for what that costs.
+func TestIntegration_ConsumerStopThenStart(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during Stop/Start cycles: %v", err)
+	})
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for i := range 30 {
+		deliveryCh, err := consumer.Start(ctx)
+		if err != nil {
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// Give the loop time to get its basic.consume on the wire on some
+		// iterations, so Stop lands both before and during one.
+		if i%2 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+
+		began := time.Now()
+		consumer.Stop()
+		if took := time.Since(began); took > 2*time.Second {
+			t.Fatalf("iteration %d: Stop took %s, expected it not to wait out a timeout", i, took)
+		}
+
+		// The loop closes its delivery channel as it returns, so an open one
+		// here means Stop came back while the loop was still running — and a
+		// request it still had outstanding would race the next Start.
+		select {
+		case _, ok := <-deliveryCh:
+			if ok {
+				t.Fatalf("iteration %d: unexpected delivery on an empty queue", i)
+			}
+		default:
+			t.Fatalf("iteration %d: Stop returned before the consume loop stopped", i)
+		}
+	}
+
+	if consumer.IsClosed() {
+		t.Fatal("Stop should not close the consumer")
+	}
+
+	// Nothing else on the connection may have been disturbed. A round trip on
+	// this consumer would not be a fair check: a stopped loop leaves its
+	// subscription registered at the broker, so the queue now has 30 consumers
+	// to round-robin between.
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the Stop/Start cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerStopAndCloseConcurrently races Stop against Close on
+// the same consumer, which a shutdown path that stops consumers and closes them
+// from different goroutines will do.
+//
+// Both have to wait for the same consume loops. Handing the loops to whichever
+// arrived first would leave the other waiting for nothing and closing the
+// channel while a request was still outstanding on it — the hazard
+// TestIntegration_ConsumerCloseImmediatelyAfterStart describes, reached by a
+// different route. Before the fix this reproduced within a handful of
+// iterations, with a 503 and both waits timing out.
+func TestIntegration_ConsumerStopAndCloseConcurrently(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost during concurrent Stop/Close: %v", err)
+	})
+
+	for i := range 30 {
+		// A server-named queue declares nothing, so no topology refresh runs and
+		// the consume loop is the only thing the two calls wait for.
+		consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := consumer.Start(ctx); err != nil {
+			cancel()
+			consumer.Close()
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// No delay: the basic.consume is still in flight, which is the point.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		began := time.Now()
+		go func() { defer wg.Done(); consumer.Stop() }()
+		go func() {
+			defer wg.Done()
+			if err := consumer.Close(); err != nil {
+				t.Errorf("iteration %d: close: %v", i, err)
+			}
+		}()
+		wg.Wait()
+		if took := time.Since(began); took > 2*time.Second {
+			t.Fatalf("iteration %d: Stop and Close took %s, expected neither to wait out a timeout", i, took)
+		}
+		cancel()
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after the concurrent Stop/Close cycles")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerCloseGivesUpOnStuckLoop drives Close down the path it
+// takes when a consume loop will not stop in time, by shortening the wait until
+// it expires against a loop that is genuinely mid-basic.consume.
+//
+// The point is what Close does next. It must not close that channel — the
+// outstanding request and the channel.close can take each other's replies,
+// after which the close never completes and the channel id is never released,
+// and enough abandoned ids bring down the connection every other publisher and
+// consumer is sharing. Leaving one channel open until the connection reclaims
+// it is the cheaper loss.
+//
+// A regression is caught by the ErrChannelBusy count, not by the health
+// checks that follow it: closing the channels anyway takes many more than
+// twenty rounds to exhaust a connection, which is exactly what made the
+// original bug so easy to miss. The health checks are here to pin the claim
+// that the path this test drives Close down is the harmless one.
+func TestIntegration_ConsumerCloseGivesUpOnStuckLoop(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost while abandoning stuck consume loops: %v", err)
+	})
+
+	orig := consumeLoopStopTimeout
+	consumeLoopStopTimeout = time.Nanosecond // expires before any loop can exit
+	t.Cleanup(func() { consumeLoopStopTimeout = orig })
+
+	var gaveUp int
+	for i := range 20 {
+		consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create consumer: %v", i, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := consumer.Start(ctx); err != nil {
+			cancel()
+			consumer.Close()
+			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
+		}
+
+		// Either outcome is legitimate — the loop may still win the race to
+		// exit — but each must leave the connection intact.
+		switch err := consumer.Close(); {
+		case errors.Is(err, ErrChannelBusy):
+			gaveUp++
+		case err != nil:
+			t.Fatalf("iteration %d: close: %v", i, err)
+		}
+		if !consumer.IsClosed() {
+			t.Fatalf("iteration %d: consumer must be closed even when its channel is left open", i)
+		}
+		cancel()
+	}
+
+	if gaveUp == 0 {
+		t.Fatal("no Close hit the stuck-loop path; the test proved nothing")
+	}
+	t.Logf("Close abandoned the channel in %d of 20 iterations", gaveUp)
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy after abandoning stuck consume loops")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerStartRefusesSecondLoop pins that a consumer consumes
+// once. A second loop would issue its basic.consume on the same channel as the
+// first, and two synchronous calls outstanding on one channel can be handed
+// each other's replies — so the second Start must be refused, not queued.
+//
+// The case that made this worth enforcing is a Start after a Stop whose wait
+// timed out: the previous loop is cancelled but demonstrably still running, and
+// nothing about the cancellation stops the request it has on the wire.
+func TestIntegration_ConsumerStartRefusesSecondLoop(t *testing.T) {
+	conn := integrationConn(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig())
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+
+	if _, err := consumer.Start(ctx); !errors.Is(err, ErrAlreadyConsuming) {
+		t.Fatalf("second Start = %v, want ErrAlreadyConsuming", err)
+	}
+	// Consume goes through Start, so it is refused on the same grounds.
+	if err := consumer.Consume(ctx, func(context.Context, *Delivery) error { return nil }); !errors.Is(err, ErrAlreadyConsuming) {
+		t.Fatalf("Consume while consuming = %v, want ErrAlreadyConsuming", err)
+	}
+
+	// Stopping releases the claim, so the consumer is restartable.
+	consumer.Stop()
+	if _, err := consumer.Start(ctx); err != nil {
+		t.Fatalf("Start after Stop: %v", err)
+	}
+}
+
+// TestIntegration_ConsumerHelpersRefusedAfterClose pins that the queue and
+// exchange helpers stop working once the consumer is closed.
+//
+// It matters most when Close left the channel open because something was still
+// using it (see ErrChannelBusy): the channel is still non-nil and would still
+// accept calls, and a call issued on it is exactly what must not happen to a
+// channel with a request already outstanding.
+func TestIntegration_ConsumerHelpersRefusedAfterClose(t *testing.T) {
+	conn := integrationConn(t)
+	conn.OnDisconnect(func(err error) {
+		t.Errorf("connection lost while calling helpers on a closed consumer: %v", err)
+	})
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+
+	// The helpers work while the consumer is open.
+	if _, err := consumer.PurgeQueue(queue); err != nil {
+		t.Fatalf("PurgeQueue on an open consumer: %v", err)
+	}
+
+	// Close with a loop still mid-basic.consume, so the channel is left open.
+	orig := consumeLoopStopTimeout
+	consumeLoopStopTimeout = time.Nanosecond
+	if _, err := consumer.Start(context.Background()); err != nil {
+		consumeLoopStopTimeout = orig
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+	closeErr := consumer.Close()
+	consumeLoopStopTimeout = orig
+	if closeErr != nil && !errors.Is(closeErr, ErrChannelBusy) {
+		t.Fatalf("close: %v", closeErr)
+	}
+	t.Logf("close returned %v", closeErr)
+
+	// Every helper must refuse, whether or not the channel was left open.
+	for name, call := range map[string]func() error{
+		"DeclareQueue": func() error { _, err := consumer.DeclareQueue(queue, true, true, false, nil); return err },
+		"BindQueue":    func() error { return consumer.BindQueue(queue, "amq.direct", "k", nil) },
+		"UnbindQueue":  func() error { return consumer.UnbindQueue(queue, "amq.direct", "k", nil) },
+		"PurgeQueue":   func() error { _, err := consumer.PurgeQueue(queue); return err },
+		"DeleteQueue":  func() error { _, err := consumer.DeleteQueue(queue, false, false); return err },
+		"DeclareExchange": func() error {
+			return consumer.DeclareExchange(DefaultExchangeConfig(queue+".ex", ExchangeDirect))
+		},
+		"DeleteExchange": func() error { return consumer.DeleteExchange(queue+".ex", false) },
+		"BindExchange":   func() error { return consumer.BindExchange("amq.fanout", "amq.direct", "k", nil) },
+		"UnbindExchange": func() error { return consumer.UnbindExchange("amq.fanout", "amq.direct", "k", nil) },
+	} {
+		if err := call(); !errors.Is(err, ErrShuttingDown) {
+			t.Errorf("%s on a closed consumer = %v, want ErrShuttingDown", name, err)
+		}
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight pins the order
+// setupChannel must keep when it retires the channel it is replacing.
+//
+// A helper can be mid-call on exactly that channel: withChannel captures the
+// channel before taking rpcMu, so the one in use is the one being retired. A
+// channel.close sent alongside that call can be answered with its reply, after
+// which the close never completes and the channel id is never released.
+//
+// Holding rpcMu here stands in for that in-flight call, which makes the
+// ordering observable rather than left to a race: the old channel must still be
+// open while the lock is held, and closed once it is released.
+func TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight(t *testing.T) {
+	conn := integrationConn(t)
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	// Not started: the consume loop would be the other user of rpcMu, and this
+	// test is about the helpers.
+	consumer.mu.RLock()
+	old := consumer.channel
+	consumer.mu.RUnlock()
+	if old == nil {
+		t.Fatal("expected the consumer to have a channel after construction")
+	}
+
+	consumer.rpcMu.Lock() // a helper is now "mid-call" on old
+
+	setupDone := make(chan error, 1)
+	go func() { setupDone <- consumer.setupChannel() }()
+
+	// Long enough that an unserialised close would have happened by now:
+	// setupChannel installs the replacement first and only then retires old.
+	time.Sleep(300 * time.Millisecond)
+	if old.ch.IsClosed() {
+		consumer.rpcMu.Unlock()
+		t.Fatal("the replaced channel was closed while a call was still outstanding on it")
+	}
+
+	consumer.rpcMu.Unlock()
+
+	select {
+	case err := <-setupDone:
+		if err != nil {
+			t.Fatalf("setupChannel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("setupChannel never returned")
+	}
+
+	// And it is closed once the call is done, rather than leaked.
+	deadline := time.Now().Add(5 * time.Second)
+	for !old.ch.IsClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the replaced channel was never closed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerCallUsesTheChannelItWaitedFor pins the other half of
+// the ordering: a call must pick its channel *after* it owns rpcMu, not before.
+//
+// Reading first leaves a window — the call captures the current channel, then
+// waits for the lock, and a replacement lands in between — after which the call
+// runs against a channel that has since been retired and fails for no reason
+// the caller could have avoided.
+//
+// The replacement here is done by hand rather than by racing setupChannel, so
+// the interleaving is forced instead of hoped for: the call is parked on the
+// lock while the channel it would have captured is swapped out and closed.
+func TestIntegration_ConsumerCallUsesTheChannelItWaitedFor(t *testing.T) {
+	conn := integrationConn(t)
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	consumer.mu.RLock()
+	old := consumer.channel
+	consumer.mu.RUnlock()
+
+	consumer.rpcMu.Lock()
+
+	// Parks on rpcMu. What it must not do is decide which channel to use before
+	// getting there.
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := consumer.PurgeQueue(queue)
+		callErr <- err
+	}()
+	time.Sleep(200 * time.Millisecond) // let it reach the lock
+
+	// Exactly what setupChannel does while a call waits: install the
+	// replacement, then retire the channel it replaced.
+	fresh, err := conn.Channel()
+	if err != nil {
+		consumer.rpcMu.Unlock()
+		t.Fatalf("open replacement channel: %v", err)
+	}
+	consumer.mu.Lock()
+	consumer.channel = fresh
+	consumer.mu.Unlock()
+	if err := old.Close(); err != nil {
+		consumer.rpcMu.Unlock()
+		t.Fatalf("close the replaced channel: %v", err)
+	}
+
+	consumer.rpcMu.Unlock()
+
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("call failed against a channel retired while it waited: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never returned")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_PublisherReplacedChannelWaitsForCallInFlight is the publisher
+// side of TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight. Its
+// publishes are asynchronous sends, but DeclareExchange and the delay-queue
+// declare behind PublishDelayed are synchronous calls on the same channel that
+// setupChannel retires on every reconnect.
+func TestIntegration_PublisherReplacedChannelWaitsForCallInFlight(t *testing.T) {
+	conn := integrationConn(t)
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	pub.mu.RLock()
+	old := pub.channel
+	pub.mu.RUnlock()
+	if old == nil {
+		t.Fatal("expected the publisher to have a channel after construction")
+	}
+
+	pub.rpcMu.Lock() // a declare is now "mid-call" on old
+
+	setupDone := make(chan error, 1)
+	go func() { setupDone <- pub.setupChannel() }()
+
+	time.Sleep(300 * time.Millisecond)
+	if old.ch.IsClosed() {
+		pub.rpcMu.Unlock()
+		t.Fatal("the replaced channel was closed while a call was still outstanding on it")
+	}
+
+	pub.rpcMu.Unlock()
+
+	select {
+	case err := <-setupDone:
+		if err != nil {
+			t.Fatalf("setupChannel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("setupChannel never returned")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !old.ch.IsClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the replaced channel was never closed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_PublisherCallUsesTheChannelItWaitedFor is the publisher side
+// of TestIntegration_ConsumerCallUsesTheChannelItWaitedFor.
+func TestIntegration_PublisherCallUsesTheChannelItWaitedFor(t *testing.T) {
+	conn := integrationConn(t)
+
+	exchange := uniqueQueue(t) + ".ex"
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+	t.Cleanup(func() { deleteExchange(t, conn, exchange) })
+
+	pub.mu.RLock()
+	old := pub.channel
+	pub.mu.RUnlock()
+
+	pub.rpcMu.Lock()
+
+	callErr := make(chan error, 1)
+	go func() {
+		callErr <- pub.DeclareExchange(exchange, ExchangeDirect, false, true, nil)
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	fresh, err := conn.Channel()
+	if err != nil {
+		pub.rpcMu.Unlock()
+		t.Fatalf("open replacement channel: %v", err)
+	}
+	pub.mu.Lock()
+	pub.channel = fresh
+	pub.mu.Unlock()
+	if err := old.Close(); err != nil {
+		pub.rpcMu.Unlock()
+		t.Fatalf("close the replaced channel: %v", err)
+	}
+
+	pub.rpcMu.Unlock()
+
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("call failed against a channel retired while it waited: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never returned")
+	}
+
+	if !conn.IsHealthy() {
+		t.Fatal("connection is no longer healthy")
+	}
+	assertRoundTrip(t, conn)
+}
+
+// assertRoundTrip publishes a message on conn and requires a consumer on the
+// same connection to receive it, proving the connection is still fully usable.
+func assertRoundTrip(t *testing.T, conn *Connection) {
+	t.Helper()
+
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+	if err != nil {
+		t.Fatalf("round trip: failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close() })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("round trip: failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("round trip: failed to start consumer: %v", err)
+	}
+
+	if err := pub.PublishText(ctx, "round-trip"); err != nil {
+		t.Fatalf("round trip: failed to publish: %v", err)
+	}
+
+	select {
+	case d, ok := <-deliveryCh:
+		if !ok {
+			t.Fatal("round trip: delivery channel closed before a message arrived")
+		}
+		if got := string(d.Body); got != "round-trip" {
+			t.Fatalf("round trip: got %q, want %q", got, "round-trip")
+		}
+		d.Ack(false)
+	case <-ctx.Done():
+		t.Fatal("round trip: no message delivered; the connection is not fully usable")
+	}
+}
+
 // --- Delayed Publishing ---
 
 func TestIntegration_PublishDelayed(t *testing.T) {
@@ -1453,6 +2116,7 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 	}
 
 	var received atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	consumeCtx, consumeCancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
@@ -1460,6 +2124,23 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_ = consumer.Consume(consumeCtx, func(_ context.Context, _ *Delivery) error {
+			// Track how many handlers overlap. Counting deliveries alone would
+			// pass just as well with the handlers run one at a time, which is
+			// the whole of what this test is for.
+			now := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				peak := maxInFlight.Load()
+				if now <= peak || maxInFlight.CompareAndSwap(peak, now) {
+					break
+				}
+			}
+
+			// Long enough that the other handler goroutines are still inside
+			// this function; prefetch is 10, so the broker has already handed
+			// over enough unacked messages to keep all of them busy.
+			time.Sleep(50 * time.Millisecond)
+
 			if received.Add(1) >= numMessages {
 				consumeCancel()
 			}
@@ -1471,6 +2152,11 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 
 	if received.Load() != numMessages {
 		t.Errorf("expected %d messages, got %d", numMessages, received.Load())
+	}
+	// Two overlapping handlers already prove the deliveries are not serialised;
+	// requiring all three would make this hostage to the scheduler.
+	if got := maxInFlight.Load(); got < 2 {
+		t.Errorf("peak concurrent handlers = %d, want at least 2: WithConcurrency(3) is not being honoured", got)
 	}
 }
 
@@ -3599,11 +4285,9 @@ func TestIntegration_TopologyRefreshCloseRace(t *testing.T) {
 			consumer.Close()
 			t.Fatalf("iteration %d: failed to start consumer: %v", i, err)
 		}
-		// Let the consume loop finish its basic.consume. Closing inside that
-		// window races the consume loop — a pre-existing hazard that has
-		// nothing to do with the refresh, and would only add noise here.
-		time.Sleep(50 * time.Millisecond)
-
+		// Closed with no delay: the consume loop's basic.consume is still in
+		// flight, which Close is required to handle (see
+		// TestIntegration_ConsumerCloseImmediatelyAfterStart).
 		done := make(chan error, 1)
 		go func() { done <- consumer.Close() }()
 		select {

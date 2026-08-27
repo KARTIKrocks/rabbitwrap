@@ -28,6 +28,19 @@ var (
 	ErrNack             = errors.New("rabbitmq: message was nacked")
 	ErrMaxReconnects    = errors.New("rabbitmq: max reconnection attempts reached")
 	ErrShuttingDown     = errors.New("rabbitmq: shutting down")
+	// ErrChannelBusy is returned by Consumer.Close when something was still
+	// using the consumer's channel — a consume loop that did not stop in time,
+	// or an in-flight call on it — which leaves that channel unsafe to close.
+	// The consumer is closed and delivers nothing further; its channel is
+	// deliberately left open and is reclaimed when the connection closes.
+	ErrChannelBusy = errors.New("rabbitmq: channel still in use; it was left open")
+	// ErrAlreadyConsuming is returned by Consumer.Start (and so by Consume) when
+	// the consumer already has a consume loop running. One consumer consumes
+	// once: a second loop would issue its basic.consume on the same channel as
+	// the first, and amqp091 does not serialise synchronous calls on a channel.
+	// Use ConsumerConfig.Concurrency for parallel handlers, or a second Consumer
+	// for a second subscription.
+	ErrAlreadyConsuming = errors.New("rabbitmq: consumer is already consuming")
 	// ErrNilConnection is returned by constructors when given a nil *Connection.
 	ErrNilConnection = errors.New("rabbitmq: nil connection")
 	// ErrNilMessage is returned by publish methods when given a nil *Message.
@@ -45,6 +58,33 @@ var (
 	// Use it for poison messages that will never succeed. May be wrapped with %w.
 	ErrDrop = errors.New("rabbitmq: drop message")
 )
+
+// channelSlotTimeout bounds how long a close waits for a synchronous call
+// already outstanding on the same channel to finish. A variable so tests can
+// shorten it.
+var channelSlotTimeout = 5 * time.Second
+
+// acquireSlot takes mu, giving up after channelSlotTimeout rather than letting
+// an unresponsive broker hold the caller open forever. It reports whether the
+// lock was taken; the caller must unlock it if so.
+//
+// It exists because a channel.close is a synchronous call like any other, and
+// one sent while a request is outstanding on the same channel can be answered
+// with that request's reply — after which the close never completes and the
+// channel id is never released. Publishers and consumers both close channels
+// they have handed to callers, so both need it.
+func acquireSlot(mu *sync.Mutex) bool {
+	deadline := time.Now().Add(channelSlotTimeout)
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 // Config holds the RabbitMQ connection configuration.
 type Config struct {

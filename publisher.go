@@ -112,11 +112,20 @@ type Return struct {
 
 // Publisher publishes messages to RabbitMQ.
 type Publisher struct {
-	conn        *Connection
-	channel     *Channel
-	config      PublisherConfig
-	mu          sync.RWMutex
-	closed      bool
+	conn    *Connection
+	channel *Channel
+	config  PublisherConfig
+	mu      sync.RWMutex
+	closed  bool
+	// rpcMu serialises the synchronous AMQP calls this publisher issues on
+	// p.channel — the exchange and delay-queue declares — and the closes of
+	// that channel. amqp091 does not serialise them itself: two outstanding on
+	// one channel both wait on the same rpc channel and either can be handed
+	// the other's reply, after which a channel.close never completes and its
+	// channel id is never released. Publishes are asynchronous sends rather
+	// than calls, so they are deliberately not held behind it.
+	// Never held while p.mu is held.
+	rpcMu       sync.Mutex
 	reconnectCh chan struct{}
 	log         Logger
 	onReturn    func(Return)
@@ -165,6 +174,40 @@ func NewPublisher(conn *Connection, config PublisherConfig) (*Publisher, error) 
 	return p, nil
 }
 
+// withChannel runs one synchronous AMQP call on the publisher's channel,
+// holding rpcMu so it cannot overlap another or the close of the very channel
+// it is using. It refuses once the publisher is closed.
+//
+// The channel is read *after* rpcMu is taken, for the reason given on
+// Consumer.withChannel: retiring a channel goes through rpcMu too, so owning it
+// first is what makes the channel read here current for the whole call.
+//
+// This is the only place that holds rpcMu and p.mu at once, and it takes them
+// in that order. Nothing acquires rpcMu while holding p.mu — Close and
+// setupChannel both release it first — so the pair cannot deadlock.
+func (p *Publisher) withChannel(fn func(*Channel) error) error {
+	p.rpcMu.Lock()
+	defer p.rpcMu.Unlock()
+
+	p.mu.RLock()
+	ch, closed := p.channel, p.closed
+	p.mu.RUnlock()
+	if closed {
+		return ErrShuttingDown
+	}
+	if ch == nil {
+		return ErrChannelClosed
+	}
+
+	return fn(ch)
+}
+
+// acquireChannelSlot takes rpcMu so a channel can be closed without colliding
+// with a call already outstanding on it. See acquireSlot.
+func (p *Publisher) acquireChannelSlot() bool {
+	return acquireSlot(&p.rpcMu)
+}
+
 // setupChannel creates a new channel, enables confirm mode if configured, and
 // declares the configured exchanges. It runs on initial setup and after every
 // reconnect.
@@ -208,7 +251,17 @@ func (p *Publisher) setupChannel() error {
 	// dead, but a channel replaced on a live connection (see watchChannelClose)
 	// would otherwise stay open and leak.
 	if old != nil {
-		_ = old.Close()
+		// A declare can be mid-call on that very channel: withChannel captures
+		// the channel before taking rpcMu, so the one it is using is the one
+		// being replaced here. Take rpcMu first, and if the call will not
+		// finish, leave the channel open rather than close one still in use —
+		// a leaked channel id costs far less than the connection.
+		if p.acquireChannelSlot() {
+			_ = old.Close()
+			p.rpcMu.Unlock()
+		} else {
+			p.log.Errorf("publisher: leaving the replaced channel open because a call on it is still in flight; it is released when the connection closes")
+		}
 	}
 
 	// Start a single return listener for this channel. It dispatches to the
@@ -516,18 +569,6 @@ func (p *Publisher) PublishDelayedToExchange(ctx context.Context, exchange, rout
 // Re-declaring on every publish also resets the queue's idle-expiry timer, so an
 // actively used delay queue stays alive while unused ones are reaped.
 func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, delay time.Duration) error {
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return ErrShuttingDown
-	}
-	ch := p.channel
-	p.mu.RUnlock()
-
-	if ch == nil {
-		return ErrChannelClosed
-	}
-
 	// x-expires must comfortably exceed the message TTL, otherwise the broker
 	// could delete the queue (and any in-flight message) before it is
 	// dead-lettered.
@@ -543,10 +584,12 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 		"x-expires":                 expires.Milliseconds(),
 	}
 
-	if _, err := ch.ch.QueueDeclare(name, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, args); err != nil {
-		return fmt.Errorf("%w: declare delay queue: %v", ErrPublishFailed, err)
-	}
-	return nil
+	return p.withChannel(func(ch *Channel) error {
+		if _, err := ch.ch.QueueDeclare(name, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, args); err != nil {
+			return fmt.Errorf("%w: declare delay queue: %v", ErrPublishFailed, err)
+		}
+		return nil
+	})
 }
 
 // DeclareExchange declares an exchange on the publisher's channel.
@@ -557,40 +600,50 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 // which declares the exchange on every channel setup and so survives both a
 // channel-level exception and a reconnect.
 func (p *Publisher) DeclareExchange(name string, kind ExchangeType, durable, autoDelete bool, args map[string]any) error {
-	p.mu.RLock()
-	ch := p.channel
-	p.mu.RUnlock()
-	if ch == nil {
-		return ErrChannelClosed
-	}
-	return ch.ch.ExchangeDeclare(
-		name,
-		string(kind),
-		durable,
-		autoDelete,
-		false, // internal
-		false, // no-wait
-		amqp.Table(args),
-	)
+	return p.withChannel(func(ch *Channel) error {
+		return ch.ch.ExchangeDeclare(
+			name,
+			string(kind),
+			durable,
+			autoDelete,
+			false, // internal
+			false, // no-wait
+			amqp.Table(args),
+		)
+	})
 }
 
 // Close closes the publisher.
 func (p *Publisher) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 
 	p.closed = true
 	p.conn.unsubscribeReconnect(p.reconnectCh)
 	close(p.reconnectCh)
+	ch := p.channel
+	// Released before rpcMu is taken below: withChannel holds rpcMu while it
+	// reads p.mu, so waiting for rpcMu with p.mu still held would deadlock the
+	// pair against each other.
+	p.mu.Unlock()
 
-	if p.channel != nil {
-		return p.channel.Close()
+	if ch == nil {
+		return nil
 	}
-	return nil
+
+	// channel.close is synchronous like the declares, so it takes its turn.
+	// p.closed is already set, so no further call can join the queue for rpcMu;
+	// this only waits out one already in flight. If even that does not finish,
+	// the channel is left open for the connection to reclaim.
+	if !p.acquireChannelSlot() {
+		p.log.Errorf("publisher: leaving the channel open because a call on it is still in flight; it is released when the connection closes")
+		return ErrChannelBusy
+	}
+	defer p.rpcMu.Unlock()
+	return ch.Close()
 }
 
 // IsClosed returns true if the publisher is closed.

@@ -699,3 +699,36 @@ func TestNewPublisher_RejectsUnnamedExchange(t *testing.T) {
 		t.Errorf("expected ErrInvalidConfig for unnamed exchange, got %v", err)
 	}
 }
+
+// TestAwaitConsumeLoopsStoppedReportsStuckLoop pins the contract Close depends
+// on: a loop that has not returned must be reported, not waited out silently.
+// Closing its channel anyway is what takes the shared connection down.
+func TestAwaitConsumeLoopsStoppedReportsStuckLoop(t *testing.T) {
+	orig := consumeLoopStopTimeout
+	consumeLoopStopTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { consumeLoopStopTimeout = orig })
+
+	c := &Consumer{log: nopLogger{}}
+
+	stopped := make(chan struct{})
+	close(stopped)
+	running := make(chan struct{}) // never closed: this loop is still going
+
+	if !c.awaitConsumeLoopsStopped(nil) {
+		t.Error("no loops at all should report stopped")
+	}
+	if !c.awaitConsumeLoopsStopped([]consumeLoopHandle{{done: stopped}}) {
+		t.Error("a loop that has returned should report stopped")
+	}
+	if c.awaitConsumeLoopsStopped([]consumeLoopHandle{{done: running}}) {
+		t.Error("a loop still running should not report stopped")
+	}
+	// A stuck loop anywhere in the set must not be masked by the ones that did
+	// stop, whichever order they are waited on in.
+	if c.awaitConsumeLoopsStopped([]consumeLoopHandle{{done: stopped}, {done: running}}) {
+		t.Error("a set containing a running loop should not report stopped")
+	}
+	if c.awaitConsumeLoopsStopped([]consumeLoopHandle{{done: running}, {done: stopped}}) {
+		t.Error("a set beginning with a running loop should not report stopped")
+	}
+}

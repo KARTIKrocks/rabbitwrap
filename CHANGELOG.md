@@ -5,6 +5,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-08-25
+
+### Fixed
+
+- **Closing a consumer no longer risks taking down the whole connection.**
+  `Close` closed the channel without waiting for the consume loop, so a `Close`
+  that followed `Start` closely enough landed while the loop still had its
+  `basic.consume` on the wire.
+
+  amqp091 does not serialise synchronous calls on a channel: both requests wait
+  on the same internal rpc channel, and either can be handed the other's reply.
+  The `channel.close` then never completes — it blocks until the connection
+  dies, and the channel id is never released — so the damage is not confined to
+  the consumer being closed. Repeating it exhausted the connection: a run of 60
+  create/`Start`/`Close` cycles first turned every `Close` into a 5s timeout and
+  then killed the connection outright with a `504 CHANNEL_ERROR`, after which
+  nothing sharing it could open a channel again. A `503 unexpected command
+  received` is the other way it surfaced.
+
+  `Close` now waits for the consume loops to return before closing the channel,
+  and a cancelled loop no longer issues a `basic.consume` it is about to
+  abandon. The same 60 cycles complete in about a second.
+
+  A `Stop` and a `Close` running concurrently on the same consumer — a shutdown
+  path that stops consumers and closes them from different goroutines — reach
+  the same hazard by another route, and now both wait for the same loops rather
+  than the second one being left with nothing to wait for.
+
+  Only a `Close` racing its own `Start` was affected — a gap of a millisecond
+  was enough to avoid it — so consumers that run for any length of time were
+  never at risk. Tests and short-lived consumers were.
+
+- **`Consumer.Close` no longer closes a channel it could not quiet.** The wait
+  for the consume loops is bounded, and on expiry `Close` used to close the
+  channel anyway — doing the exact thing the wait exists to prevent, at the
+  moment it is most likely to hurt, since a loop only fails to stop when the
+  broker has gone quiet. It now returns the new `ErrChannelBusy` and
+  leaves that one channel open for the connection to reclaim. Losing a channel
+  id until the connection closes is far cheaper than losing the connection every
+  other publisher and consumer is sharing. The consumer is closed either way and
+  delivers nothing further.
+
+- **Every synchronous call a consumer makes on its channel now takes its turn.**
+  The queue and exchange helpers (`DeclareQueue`, `BindQueue`, `PurgeQueue`,
+  `DeleteQueue`, `DeclareExchange`, `DeleteExchange`, `BindExchange`,
+  `UnbindExchange`, `UnbindQueue`) ran on the same channel as the consume loop,
+  so calling one while the loop was establishing its subscription hit the same
+  reply-mixing hazard. They are serialised with the loop's `basic.consume` and
+  with the `channel.close` in `Close`.
+
+  They also refuse, with `ErrShuttingDown`, once the consumer is closed. That
+  matters most when `Close` returned `ErrChannelBusy` and deliberately left the
+  channel open: it is still non-nil and would otherwise still accept calls —
+  issued on a channel that already has a request outstanding, which is the one
+  thing that must not happen to it.
+
+- **Closing a channel that is being replaced now waits its turn too.** Both
+  `setupChannel` implementations close the channel they replace, and a call can
+  be in flight on exactly that channel — the helpers capture the channel before
+  taking their turn, so the one in use is the one being retired. The close now
+  takes the same lock, and leaves the channel open rather than close one still
+  in use.
+
+- **The publisher had the same gap.** `DeclareExchange` and the delay-queue
+  declare behind `PublishDelayed` are synchronous calls on `p.channel`, which
+  `setupChannel` retires on every reconnect and `Close` closes — none of it
+  serialised. Publishes themselves are asynchronous sends, not calls, so they
+  are deliberately still not serialised and throughput is unaffected.
+
+- **A call now picks its channel after it owns the lock, not before.** Reading
+  first left a window: the call captured the current channel, then waited its
+  turn, and a replacement landing in between left it running against a channel
+  that had since been retired — a `504 channel/connection is not open` the
+  caller could do nothing about, during recovery, when it is least welcome.
+  Both consumer and publisher were affected. The consume loop's own failure
+  path also retired its channel without taking the lock, which could have
+  closed one out from under a call waiting on it.
+
+### Changed
+
+- **A consumer consumes once.** `Start`, and so `Consume`, now returns the new
+  `ErrAlreadyConsuming` when a consume loop is already running instead of
+  starting a second one on the same channel. Two loops meant two `basic.consume`
+  calls on one channel, and the case that made it worth enforcing is a `Start`
+  racing a `Stop`, or following one whose wait timed out: the previous loop is
+  cancelled but still running, and cancelling it does nothing about the request
+  it already has on the wire. Use `WithConcurrency` for parallel handlers, or a
+  second consumer for a second subscription.
+
+- **`Consumer.Stop` returns once consumption has actually stopped**, rather than
+  only having asked it to. It previously returned while the loop could still
+  have a request outstanding, which a `Start` called straight afterwards would
+  then race in exactly the way described above. The wait is normally immediate
+  and is capped at 5s.
+
+  `Stop` still does not cancel the subscription at the broker — only closing the
+  channel does that — so each `Start` after a `Stop` adds another consumer to
+  the queue. Close the consumer and create a new one instead of cycling one
+  through stop/start.
+
 ## [0.13.0] - 2026-08-01
 
 ### Fixed

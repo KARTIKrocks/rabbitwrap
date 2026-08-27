@@ -415,6 +415,20 @@ defer cancel()
 consumer.CloseWithContext(ctx)
 ```
 
+The deadline covers draining in-flight handlers. Close always takes the moment
+it needs to stop consuming first, however tight the deadline, because closing a
+channel with a request still outstanding on it can break the whole connection —
+so closing a consumer is safe at any point, including immediately after `Start`.
+If the channel cannot be quieted — the broker has gone quiet and a consume loop
+or an in-flight call is still using it — Close returns `ErrChannelBusy` and
+leaves that one channel open for the connection to reclaim, rather than close a
+channel still in use and risk the connection with it. The consumer is closed
+either way, and its queue and exchange methods stop accepting work.
+
+A consumer consumes once: `Start` (and `Consume`) return `ErrAlreadyConsuming`
+if one is already running. Use `WithConcurrency` for parallel handlers, or a
+second consumer for a second subscription.
+
 ### Manual Message Handling
 
 ```go
