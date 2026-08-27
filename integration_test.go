@@ -1697,6 +1697,7 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 	}
 
 	var received atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	consumeCtx, consumeCancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
@@ -1704,6 +1705,23 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_ = consumer.Consume(consumeCtx, func(_ context.Context, _ *Delivery) error {
+			// Track how many handlers overlap. Counting deliveries alone would
+			// pass just as well with the handlers run one at a time, which is
+			// the whole of what this test is for.
+			now := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				peak := maxInFlight.Load()
+				if now <= peak || maxInFlight.CompareAndSwap(peak, now) {
+					break
+				}
+			}
+
+			// Long enough that the other handler goroutines are still inside
+			// this function; prefetch is 10, so the broker has already handed
+			// over enough unacked messages to keep all of them busy.
+			time.Sleep(50 * time.Millisecond)
+
 			if received.Add(1) >= numMessages {
 				consumeCancel()
 			}
@@ -1715,6 +1733,11 @@ func TestIntegration_ConcurrentConsumer(t *testing.T) {
 
 	if received.Load() != numMessages {
 		t.Errorf("expected %d messages, got %d", numMessages, received.Load())
+	}
+	// Two overlapping handlers already prove the deliveries are not serialised;
+	// requiring all three would make this hostage to the scheduler.
+	if got := maxInFlight.Load(); got < 2 {
+		t.Errorf("peak concurrent handlers = %d, want at least 2: WithConcurrency(3) is not being honoured", got)
 	}
 }
 
