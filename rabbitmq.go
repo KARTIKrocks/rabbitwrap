@@ -297,10 +297,7 @@ func (c Config) reconnectDelay(attempt int) time.Duration {
 		maxDelay = 60 * time.Second
 	}
 
-	backoff := time.Duration(float64(delay) * math.Pow(2, float64(attempt)))
-	if backoff > maxDelay {
-		backoff = maxDelay
-	}
+	backoff := min(time.Duration(float64(delay)*math.Pow(2, float64(attempt))), maxDelay)
 	return backoff
 }
 

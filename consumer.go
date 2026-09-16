@@ -417,7 +417,7 @@ func NewConsumer(conn *Connection, config ConsumerConfig) (*Consumer, error) {
 func (c *Consumer) setupChannel() error {
 	ch, err := c.conn.Channel()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrChannelClosed, err)
+		return fmt.Errorf("%w: %w", ErrChannelClosed, err)
 	}
 
 	if err := ch.SetQos(c.config.PrefetchCount, c.config.PrefetchSize, false); err != nil {
@@ -729,7 +729,7 @@ func (c *Consumer) applyRefresh(ch *Channel) error {
 			// round-trip — so this failure is about a queue that no longer
 			// exists, not about the configured topology. The next tick binds
 			// the new name.
-			return fmt.Errorf("%w: %v", errStaleRefreshTarget, err)
+			return fmt.Errorf("%w: %w", errStaleRefreshTarget, err)
 		}
 		return err
 	}

@@ -1,5 +1,5 @@
 module github.com/KARTIKrocks/rabbitwrap
 
-go 1.22
+go 1.27
 
 require github.com/rabbitmq/amqp091-go v1.14.0

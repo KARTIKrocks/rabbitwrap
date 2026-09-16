@@ -1,7 +1,8 @@
-GOLANGCI_LINT_VERSION := v2.12.2
-GOIMPORTS_VERSION := v0.47.0
+GOLANGCI_LINT_VERSION := v2.13.2
+GOIMPORTS_VERSION := v0.50.0
+GOVULNCHECK_VERSION := v1.8.0
 
-.PHONY: all setup deps test test-v test-integration vet lint build fmt cover clean ci docker-up docker-down
+.PHONY: all setup deps tidy tidy-check test test-v test-integration vet lint lint-fix fix build fmt cover clean ci vuln docker-up docker-down
 
 all: fmt vet lint test build
 
@@ -15,10 +16,34 @@ setup:
 		echo "Installing goimports $(GOIMPORTS_VERSION)..."; \
 		go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION); \
 	}
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		echo "Installing govulncheck $(GOVULNCHECK_VERSION)..."; \
+		go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
+	}
 
 ## Download module dependencies
 deps:
 	go mod download
+
+## Tidy go.mod/go.sum
+tidy:
+	go mod tidy
+
+## Fail if go.mod/go.sum is not tidy, without leaving the change behind.
+tidy-check:
+	@status=$$(git status --porcelain -- go.mod go.sum); \
+	if [ -n "$$status" ]; then \
+		echo "go.mod/go.sum already modified; commit or stash before running tidy-check"; \
+		exit 1; \
+	fi
+	@$(MAKE) --no-print-directory tidy
+	@if ! git diff --quiet -- go.mod go.sum; then \
+		echo "go.mod/go.sum are not tidy — run 'make tidy' and commit:"; \
+		git diff --stat -- go.mod go.sum; \
+		git checkout -- go.mod go.sum; \
+		exit 1; \
+	fi
+	@echo "go.mod/go.sum tidy"
 
 ## Run all tests with race detector
 test:
@@ -36,12 +61,25 @@ vet:
 lint: setup
 	golangci-lint run --build-tags=integration ./...
 
+## Run golangci-lint with auto-fix
+lint-fix: setup
+	golangci-lint run --build-tags=integration --fix ./...
+
+## Fix code formatting and linting issues
+fix: fmt lint-fix
+
+## Scan for known vulnerabilities. Needs network access — the advisory
+## database is fetched on every run.
+vuln: setup
+	govulncheck ./...
+
 ## Build all packages
 build:
 	go build ./...
 
 ## Format code
 fmt: setup
+	gofmt -s -w .
 	goimports -w .
 
 ## Run tests with coverage report
@@ -66,5 +104,5 @@ docker-down:
 test-integration: docker-up
 	go test -race -count=1 -tags=integration -timeout 120s ./...
 
-## CI pipeline: vet, lint, test
-ci: vet lint test
+## CI pipeline: vet, lint, test, vulnerability scan
+ci: vet lint test vuln

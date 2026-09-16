@@ -3,7 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"maps"
+	"strconv"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -131,7 +132,7 @@ func (m *Message) WithExpiration(expiration string) *Message {
 
 // WithTTL sets the TTL as a duration.
 func (m *Message) WithTTL(ttl time.Duration) *Message {
-	m.Expiration = fmt.Sprintf("%d", ttl.Milliseconds())
+	m.Expiration = strconv.FormatInt(ttl.Milliseconds(), 10)
 	return m
 }
 
@@ -167,9 +168,7 @@ func (m *Message) WithHeaders(headers map[string]any) *Message {
 	if m.Headers == nil {
 		m.Headers = make(map[string]any)
 	}
-	for k, v := range headers {
-		m.Headers[k] = v
-	}
+	maps.Copy(m.Headers, headers)
 	return m
 }
 
@@ -179,9 +178,7 @@ func (m *Message) WithHeaders(headers map[string]any) *Message {
 func (m *Message) clone() *Message {
 	c := *m
 	c.Headers = make(map[string]any, len(m.Headers))
-	for k, v := range m.Headers {
-		c.Headers[k] = v
-	}
+	maps.Copy(c.Headers, m.Headers)
 	return &c
 }
 
@@ -244,10 +241,8 @@ func (d *Delivery) Reject(requeue bool) error {
 
 // fromDelivery converts from amqp.Delivery.
 func fromDelivery(d amqp.Delivery) *Delivery {
-	headers := make(map[string]any)
-	for k, v := range d.Headers {
-		headers[k] = v
-	}
+	headers := make(map[string]any, len(d.Headers))
+	maps.Copy(headers, d.Headers)
 
 	return &Delivery{
 		Message: &Message{
