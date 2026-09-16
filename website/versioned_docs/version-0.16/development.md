@@ -29,10 +29,11 @@ make docker-up
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/KARTIKrocks/rabbitwrap/blob/main/CONTRIBUTING.md)
-on the main branch — that's where the Go module itself lives; this
-documentation site lives on the `website` branch (see this site's
-[README](https://github.com/KARTIKrocks/rabbitwrap/blob/website/README.md)).
+See [CONTRIBUTING.md](https://github.com/KARTIKrocks/rabbitwrap/blob/main/CONTRIBUTING.md).
+This documentation site lives in [`website/`](https://github.com/KARTIKrocks/rabbitwrap/tree/main/website)
+alongside the code — see that directory's own
+[README](https://github.com/KARTIKrocks/rabbitwrap/blob/main/website/README.md)
+for local dev commands.
 
 ## License
 

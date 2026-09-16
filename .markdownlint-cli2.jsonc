@@ -25,7 +25,7 @@
     // produces them fresh every release, gating on it would mean hand-editing
     // the changelog after each tag forever. GitHub and Docusaurus both
     // autolink bare URLs, so the reader loses nothing.
-    "CHANGELOG.md"
+    "**/CHANGELOG.md"
   ],
 
   "config": {

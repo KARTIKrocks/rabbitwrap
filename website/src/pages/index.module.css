@@ -75,13 +75,6 @@
   text-wrap: pretty;
 }
 
-.sectionNote {
-  margin-block: 1.25rem 0;
-  font-size: 0.85rem;
-  opacity: 0.75;
-  text-wrap: pretty;
-}
-
 /* Tables overflow rather than squeezing their columns on narrow screens. */
 .tableScroll {
   overflow-x: auto;

@@ -41,9 +41,10 @@ const allVersions: string[] = fs.existsSync(versionsFile)
   : [];
 
 /**
- * `DOCS_FAST_BUILD=true` builds only the in-progress docs. Used by `start` and
- * by the PR build check, where rebuilding every historical version is wasted
- * work. Production deploys build the full live set.
+ * `DOCS_FAST_BUILD=true` builds only the in-progress docs plus the newest
+ * live version. Used by `start` and by the PR build check, where rebuilding
+ * every historical version is wasted work. Production deploys build the
+ * full live set.
  */
 const fastBuild = process.env.DOCS_FAST_BUILD === 'true';
 const liveVersions = allVersions.slice(0, MAX_LIVE_VERSIONS);

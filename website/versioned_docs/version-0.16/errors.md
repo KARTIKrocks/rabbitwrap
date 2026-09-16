@@ -19,6 +19,7 @@ rabbitmq.ErrMaxReconnects     // Max reconnection attempts reached (see OnReconn
 rabbitmq.ErrShuttingDown      // Shutting down
 rabbitmq.ErrNilConnection     // A nil connection was passed to a constructor
 rabbitmq.ErrNilMessage        // A nil message was passed to a publish call
+rabbitmq.ErrDelayTooLong      // PublishDelayed's delay exceeds the largest ladder rung
 
 if errors.Is(err, rabbitmq.ErrConnectionClosed) {
     // Handle...
@@ -34,8 +35,7 @@ rabbitmq.ErrRequeue // requeue and retry
 rabbitmq.ErrDrop    // never requeue (dead-letter/discard)
 ```
 
-`Consumer.Close`/`CloseWithContext` and the imperative queue/exchange helpers
-also have their own sentinels — `ErrAlreadyConsuming`, `ErrChannelBusy`,
-`ErrConsumerTagInUse` — documented alongside the methods that return them in
-[Consuming Messages](./consuming.md) and
-[Queue and Exchange Management](./queue-exchange-management.md).
+`Consumer.Start` and `Close`/`CloseWithContext` have their own sentinels —
+`ErrAlreadyConsuming`, `ErrConsumerTagInUse` from `Start`, `ErrChannelBusy`
+from `Close` — documented alongside the methods that return them in
+[Consuming Messages](./consuming.md).

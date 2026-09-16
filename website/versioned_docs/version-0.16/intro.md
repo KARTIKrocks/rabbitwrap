@@ -54,4 +54,4 @@ generated from the source and is always authoritative.
 
 ## Requirements
 
-Go 1.27 or later.
+Go 1.22 or later.
