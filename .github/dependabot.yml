@@ -10,6 +10,32 @@ updates:
       - dependencies
     open-pull-requests-limit: 5
 
+  # The documentation site lives on the `website` branch, not here — see that
+  # branch's README for why. Dependabot config itself must live on the
+  # default branch, but `target-branch` lets it open PRs against another one.
+  # Grouped on purpose: Docusaurus pulls in a large transitive tree, and
+  # ungrouped weekly updates would bury the Go module PRs above that actually
+  # affect what users import. The Docs workflow builds the site on each one,
+  # so a bad bump fails before merge.
+  - package-ecosystem: npm
+    directory: /
+    target-branch: website
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    open-pull-requests-limit: 3
+    groups:
+      docusaurus:
+        patterns:
+          - "@docusaurus/*"
+          - "@mdx-js/*"
+      website:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

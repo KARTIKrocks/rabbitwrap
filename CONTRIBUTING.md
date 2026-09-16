@@ -47,9 +47,18 @@ golangci-lint run ./...
 - Keep commits focused — one logical change per commit
 - Use meaningful commit messages
 
+### Documentation site
+
+The guides at <https://kartikrocks.github.io/rabbitwrap/> live on the
+`website` branch, not here — see that branch's own `README.md` for why. A PR
+here that changes documented behaviour (a new option, a changed default, a
+rename) needs a follow-up PR against `website` to keep the guides accurate;
+it does not have to land in the same PR.
+
 ## Reporting Issues
 
 Open an issue with:
+
 - A clear description of the problem
 - Steps to reproduce
 - Expected vs actual behavior

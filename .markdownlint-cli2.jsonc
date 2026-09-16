@@ -1,0 +1,43 @@
+// Structural linting for every Markdown file on this branch — the root
+// README and the contributor/security policies. The docs site has its own
+// copy of this config on the `website` branch.
+//
+// Scope note: this checks *structure*, not prose. It catches the things that
+// render wrong or read wrong in a diff — malformed tables, skipped heading
+// levels, list indentation that silently changes nesting, unclosed fences. It
+// deliberately has no opinion on wording; see CONTRIBUTING.md for that.
+{
+  "globs": ["**/*.md"],
+
+  // Without this, the scan walks straight into gitignored working
+  // directories — local scratch notes, .claude — and reports failures for
+  // files that are not part of the project.
+  "gitignore": true,
+
+  "ignores": [
+    // Assembled from GitHub's auto-generated release notes, which emit bare
+    // "by @user in <url>" lines. Those trip MD034, and since the generator
+    // produces them fresh every release, gating on it would mean
+    // hand-editing the changelog after each tag forever. GitHub autolinks
+    // bare URLs, so the reader loses nothing.
+    "CHANGELOG.md"
+  ],
+
+  "config": {
+    "default": true,
+
+    // Prose here is hand-wrapped at 80, but tables, long links, and Go
+    // identifiers in code spans routinely exceed it and cannot be wrapped
+    // without breaking what they mean. Enforcing a column limit would mean
+    // reflowing tables into something less readable to satisfy a linter, so
+    // the wrapping stays a convention rather than a gate.
+    "MD013": false,
+
+    // The centred README header (logo, badges, tagline) has no Markdown
+    // equivalent. Allow the presentational tags actually in use and keep the
+    // rule on, so anything beyond this list still gets flagged.
+    "MD033": {
+      "allowed_elements": ["a", "b", "h1", "img", "p", "picture", "source"]
+    }
+  }
+}
