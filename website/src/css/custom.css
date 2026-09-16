@@ -1,0 +1,109 @@
+/**
+ * Global styles. Infima is bundled by the classic theme.
+ *
+ * Infima drives `color-scheme` from `--ifm-color-scheme`, which it flips under
+ * [data-theme='dark']. That makes `light-dark()` authoritative here, so every
+ * token is a single declaration instead of a light block plus a dark override.
+ */
+
+@layer rabbitwrap.tokens, rabbitwrap.base, rabbitwrap.content;
+
+@layer rabbitwrap.tokens {
+  :root {
+    /* Primary — teal-600 light / teal-400 dark, with Infima's six shades */
+    --ifm-color-primary: light-dark(#0d9488, #2dd4bf);
+    --ifm-color-primary-dark: light-dark(#0f766e, #14b8a6);
+    --ifm-color-primary-darker: light-dark(#115e59, #0d9488);
+    --ifm-color-primary-darkest: light-dark(#134e4a, #0f766e);
+    --ifm-color-primary-light: light-dark(#14b8a6, #5eead4);
+    --ifm-color-primary-lighter: light-dark(#2dd4bf, #99f6e4);
+    --ifm-color-primary-lightest: light-dark(#5eead4, #ccfbf1);
+
+    /* Neutrals — slate */
+    --ifm-background-color: light-dark(#ffffff, #0f172a);
+    --ifm-background-surface-color: light-dark(#f8fafc, #1e293b);
+    --ifm-font-color-base: light-dark(#334155, #e2e8f0);
+    --ifm-heading-color: light-dark(#0f172a, #f1f5f9);
+    --ifm-toc-border-color: light-dark(#e2e8f0, #334155);
+    --ifm-color-emphasis-300: light-dark(#e2e8f0, #334155);
+
+    /* Accent — amber, used for inline code and "message in flight" motifs */
+    --rabbitwrap-accent: light-dark(#b45309, #fbbf24);
+    --rabbitwrap-surface: light-dark(#f1f5f9, #1e293b);
+
+    --ifm-code-font-size: 90%;
+    --ifm-font-family-base:
+      "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+
+    --docusaurus-highlighted-code-line-bg: light-dark(
+      rgb(0 0 0 / 0.1),
+      rgb(255 255 255 / 0.1)
+    );
+  }
+}
+
+@layer rabbitwrap.base {
+  :where(html) {
+    scroll-behavior: smooth;
+    scroll-padding-block-start: 5rem;
+
+    @media (prefers-reduced-motion: reduce) {
+      scroll-behavior: auto;
+    }
+  }
+
+  :where(h1, h2, h3) {
+    text-wrap: balance;
+  }
+
+  :where(p) {
+    text-wrap: pretty;
+  }
+
+  /* Inline code picks up the accent colour */
+  :where(code) {
+    background-color: var(--rabbitwrap-surface);
+    border: none;
+    color: var(--rabbitwrap-accent);
+  }
+
+  :where(a) code {
+    color: inherit;
+  }
+
+  ::-webkit-scrollbar {
+    inline-size: 8px;
+    block-size: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--ifm-background-color);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--ifm-toc-border-color);
+    border-radius: 4px;
+  }
+}
+
+@layer rabbitwrap.content {
+  /*
+   * API tables: the first column holds identifiers, so it must not wrap.
+   * The table scrolls inside its own container rather than the page.
+   */
+  .markdown table {
+    display: block;
+    overflow-x: auto;
+    max-inline-size: 100%;
+    font-size: 0.9rem;
+
+    & td:first-child {
+      white-space: nowrap;
+      font-family: var(--ifm-font-family-monospace);
+
+      & code {
+        white-space: nowrap;
+      }
+    }
+  }
+}

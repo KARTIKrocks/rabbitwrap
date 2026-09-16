@@ -11,6 +11,15 @@ Guidance for working in this repo. See `CONTRIBUTING.md`, `Makefile`, and
 - **Package name is `rabbitmq`** (not `rabbitwrap`), so imports look like
   `import rabbitmq "github.com/KARTIKrocks/rabbitwrap"`.
 
+## Documentation site
+
+The guides at <https://kartikrocks.github.io/rabbitwrap/> are a Docusaurus
+site in `website/`, built and deployed by `.github/workflows/docs.yml`. It
+lives alongside the code on purpose (see `website/README.md`): a PR that
+changes documented behaviour should update `website/docs/` in the same
+review, not a follow-up. See `website/VERSIONING.md` for how the versioned
+snapshots work.
+
 ## Commands
 
 - `make test` — unit tests with the race detector (`go test -race`).

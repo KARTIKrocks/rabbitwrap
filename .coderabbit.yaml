@@ -39,6 +39,9 @@ reviews:
     - "!**/go.work.sum"
     - "!**/coverage.out"
     - "!**/coverage.html"
+    - "!website/package-lock.json"
+    - "!website/build/**"
+    - "!website/.docusaurus/**"
 
   path_instructions:
     - path: "**/*.go"
@@ -63,6 +66,25 @@ reviews:
         Example code prioritizes clarity for readers. Be lenient on lint-style
         issues, but still flag misuse of the library API or resource leaks
         (unclosed connections/channels) that would mislead users.
+    - path: "website/docs/**"
+      instructions: >-
+        Docusaurus source for the unreleased ("Next") docs. Check that code
+        samples match the current public API — flag a sample calling a
+        renamed, removed, or signature-changed method — and that a
+        behaviour-changing PR touching *.go also updates the relevant page
+        here (see website/README.md).
+    - path: "website/versioned_docs/**"
+      instructions: >-
+        Frozen snapshots of an already-released version's docs (see
+        website/VERSIONING.md). Flag an edit here that isn't a correction to
+        what that version actually shipped — new content belongs in
+        website/docs/ instead.
+    - path: "website/src/**"
+      instructions: >-
+        Docusaurus site React/TypeScript (landing page, theme). Biome and
+        `tsc --noEmit` already gate style and types in CI; focus on broken
+        links, accessibility (alt text, landmark roles), and content drifting
+        out of sync with the root README's feature/capability list.
 
   tools:
     # Reuse the repo's existing golangci-lint v2 config (.golangci.yml).
