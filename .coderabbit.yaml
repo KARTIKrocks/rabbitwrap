@@ -32,6 +32,10 @@ reviews:
     drafts: false
     base_branches:
       - main
+      # The Docusaurus docs site lives on its own long-lived branch (see
+      # AGENTS.md) rather than a directory on main, so PRs against it need
+      # their own auto-review trigger.
+      - website
 
   path_filters:
     # Skip generated / non-reviewable files to keep reviews focused.
@@ -63,6 +67,22 @@ reviews:
         Example code prioritizes clarity for readers. Be lenient on lint-style
         issues, but still flag misuse of the library API or resource leaks
         (unclosed connections/channels) that would mislead users.
+    - path: "docs/**"
+      instructions: >-
+        These are the Docusaurus source pages for the `website` branch (this
+        instruction only applies to PRs targeting that branch). Check that
+        code samples match the current public API — flag a sample calling a
+        renamed, removed, or signature-changed method. `docs/` is unreleased
+        and tracks the branch; a snapshot under `versioned_docs/` is frozen
+        history for an already-released version and should not be edited for
+        new content (see VERSIONING.md) — flag an edit there that isn't a
+        correction to what that version actually shipped.
+    - path: "src/**"
+      instructions: >-
+        Docusaurus site React/TypeScript (landing page, theme). Biome and
+        `tsc --noEmit` already gate style and types in CI; focus on broken
+        links, accessibility (alt text, landmark roles), and content drifting
+        out of sync with the root README's feature/capability list.
 
   tools:
     # Reuse the repo's existing golangci-lint v2 config (.golangci.yml).
