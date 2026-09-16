@@ -47,9 +47,18 @@ golangci-lint run ./...
 - Keep commits focused — one logical change per commit
 - Use meaningful commit messages
 
+### Documentation site
+
+The guides at <https://kartikrocks.github.io/rabbitwrap/> are built from
+`website/docs/`. A PR that changes documented behaviour (a new option, a
+changed default, a rename) should update those pages in the same review —
+see `website/README.md` for local dev commands and `website/VERSIONING.md`
+before touching an already-released snapshot under `website/versioned_docs/`.
+
 ## Reporting Issues
 
 Open an issue with:
+
 - A clear description of the problem
 - Steps to reproduce
 - Expected vs actual behavior

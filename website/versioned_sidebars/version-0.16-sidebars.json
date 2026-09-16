@@ -1,0 +1,38 @@
+{
+  "docsSidebar": [
+    "intro",
+    "getting-started",
+    {
+      "type": "category",
+      "label": "Core",
+      "collapsed": false,
+      "items": [
+        "connection",
+        "publishing",
+        "consuming",
+        "messages"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Reliability",
+      "collapsed": false,
+      "items": [
+        "topology",
+        "dead-letter-queues",
+        "middleware"
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Operations",
+      "collapsed": false,
+      "items": [
+        "queue-exchange-management",
+        "health-checks",
+        "errors"
+      ]
+    },
+    "development"
+  ]
+}
