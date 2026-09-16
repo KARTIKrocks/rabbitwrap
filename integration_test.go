@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1737,73 +1739,326 @@ func TestIntegration_ConsumerReplacedChannelWaitsForCallInFlight(t *testing.T) {
 	assertRoundTrip(t, conn)
 }
 
-// TestIntegration_ConsumerCallUsesTheChannelItWaitedFor pins the other half of
-// the ordering: a call must pick its channel *after* it owns rpcMu, not before.
+// TestIntegration_IdleConsumerHelpersRecover covers a consumer that is not
+// consuming — one that never started, or was stopped.
 //
-// Reading first leaves a window — the call captures the current channel, then
-// waits for the lock, and a replacement lands in between — after which the call
-// runs against a channel that has since been retired and fails for no reason
-// the caller could have avoided.
-//
-// The replacement here is done by hand rather than by racing setupChannel, so
-// the interleaving is forced instead of hoped for: the call is parked on the
-// lock while the channel it would have captured is swapped out and closed.
-func TestIntegration_ConsumerCallUsesTheChannelItWaitedFor(t *testing.T) {
-	conn := integrationConn(t)
+// Its queue and exchange calls used to run on the channel the consume loop
+// owns, and only that loop ever re-establishes it. So anything that killed the
+// channel left every later call failing 504 for the rest of the consumer's
+// life, while the connection itself stayed perfectly healthy: nothing looked
+// broken, and nothing recovered. Both ways of killing it are covered, since the
+// consumer sees neither.
+func TestIntegration_IdleConsumerHelpersRecover(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kill func(t *testing.T, conn *Connection, c *Consumer, queue string)
+	}{
+		{"channel-level exception", func(t *testing.T, _ *Connection, c *Consumer, queue string) {
+			// NOT_FOUND on a missing exchange; the broker closes the channel.
+			if err := c.BindQueue(queue, "exchange-that-does-not-exist", "k", nil); err == nil {
+				t.Fatal("expected binding to a missing exchange to fail")
+			}
+		}},
+		{"connection loss", func(t *testing.T, conn *Connection, _ *Consumer, _ string) {
+			if err := underlyingConn(conn).Close(); err != nil {
+				t.Fatalf("close underlying connection: %v", err)
+			}
+			waitForReconnected(t, conn)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := integrationConn(t)
+			queue := uniqueQueue(t)
+			consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+				WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+			if err != nil {
+				t.Fatalf("failed to create consumer: %v", err)
+			}
+			t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
 
+			if _, err := consumer.PurgeQueue(queue); err != nil {
+				t.Fatalf("purge while healthy: %v", err)
+			}
+
+			tc.kill(t, conn, consumer, queue)
+
+			// The very next call must work: the channel is re-opened on demand,
+			// with no consume loop anywhere to do it.
+			if _, err := consumer.PurgeQueue(queue); err != nil {
+				t.Fatalf("purge after the channel was killed: %v", err)
+			}
+		})
+	}
+}
+
+// TestIntegration_ConsumerHelperRefusedWhenCloseRacesIt forces the interleaving
+// where a queue or exchange call is already under way when Close runs.
+//
+// The call must not open itself a fresh channel on the far side of that: it
+// would succeed on a closed consumer, which the contract says cannot happen,
+// and nothing would be left to close what it opened — the channel would sit
+// there until the connection went.
+func TestIntegration_ConsumerHelperRefusedWhenCloseRacesIt(t *testing.T) {
+	conn := integrationConn(t)
 	queue := uniqueQueue(t)
+
 	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
-		WithQueueConfig(DefaultQueueConfig(queue).WithAutoDelete(true)))
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
 	if err != nil {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
-	t.Cleanup(func() { consumer.Close() })
+	t.Cleanup(func() { deleteQueue(t, conn, queue) })
 
-	consumer.mu.RLock()
-	old := consumer.channel
-	consumer.mu.RUnlock()
-
-	consumer.rpcMu.Lock()
-
-	// Parks on rpcMu. What it must not do is decide which channel to use before
-	// getting there.
+	// Park a call on opsMu, past the point where it would have checked whether
+	// the consumer was closed if that check came first.
+	consumer.opsMu.Lock()
 	callErr := make(chan error, 1)
 	go func() {
 		_, err := consumer.PurgeQueue(queue)
 		callErr <- err
 	}()
-	time.Sleep(200 * time.Millisecond) // let it reach the lock
+	time.Sleep(200 * time.Millisecond)
 
-	// Exactly what setupChannel does while a call waits: install the
-	// replacement, then retire the channel it replaced.
-	fresh, err := conn.Channel()
-	if err != nil {
-		consumer.rpcMu.Unlock()
-		t.Fatalf("open replacement channel: %v", err)
-	}
-	consumer.mu.Lock()
-	consumer.channel = fresh
-	consumer.mu.Unlock()
-	if err := old.Close(); err != nil {
-		consumer.rpcMu.Unlock()
-		t.Fatalf("close the replaced channel: %v", err)
+	// Let Close run all the way through while the call is parked.
+	origSlot := channelSlotTimeout
+	channelSlotTimeout = 50 * time.Millisecond
+	closeErr := consumer.Close()
+	channelSlotTimeout = origSlot
+	if closeErr != nil {
+		t.Fatalf("close: %v", closeErr)
 	}
 
-	consumer.rpcMu.Unlock()
+	consumer.opsMu.Unlock()
 
-	select {
-	case err := <-callErr:
-		if err != nil {
-			t.Fatalf("call failed against a channel retired while it waited: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the call never returned")
+	if err := <-callErr; !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("call resumed after Close = %v, want ErrShuttingDown", err)
+	}
+
+	consumer.opsMu.Lock()
+	left := consumer.opsCh
+	consumer.opsMu.Unlock()
+	if left != nil && !left.ch.IsClosed() {
+		t.Error("the call opened a channel on a closed consumer; nothing is left to close it")
 	}
 
 	if !conn.IsHealthy() {
 		t.Fatal("connection is no longer healthy")
 	}
-	assertRoundTrip(t, conn)
+}
+
+// TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker pins that Close
+// returns when the broker has stopped answering.
+//
+// Both channels a consumer holds are closed with a synchronous channel.close,
+// and a broker that has gone quiet never answers one. Close has to return
+// regardless: abandoning a channel costs an id until the connection goes,
+// where hanging costs the caller's shutdown.
+//
+// The broker is paused rather than stopped, so the connection stays up and the
+// close really is left waiting — which is what an unresponsive broker does, and
+// what closing the connection instead would not reproduce.
+//
+// The deadline is what makes this discriminating. An unbounded close is not
+// infinite here: amqp091's heartbeat gives up on the peer after about fifteen
+// seconds and fails the call for it. So the test asserts a time well inside
+// that, not merely that Close returns — otherwise it would pass either way.
+// With Heartbeat set to 0 there is nothing to give up, and unbounded really
+// would mean forever.
+func TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+
+	// Open the queue/exchange channel, so Close has both to deal with.
+	if _, err := consumer.PurgeQueue(queue); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	origClose, origSlot := closeTimeout, channelSlotTimeout
+	closeTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeTimeout, channelSlotTimeout = origClose, origSlot })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- consumer.Close() }()
+
+	select {
+	case <-done:
+		// Any outcome is fine; returning promptly is the point.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the channel")
+	}
+}
+
+// TestIntegration_PublisherCloseSurvivesUnresponsiveBroker is the publisher side
+// of TestIntegration_ConsumerCloseSurvivesUnresponsiveBroker. Same reasoning,
+// same discriminating deadline: unbounded is not infinite here, it is however
+// long the connection takes to give up on a silent peer.
+func TestIntegration_PublisherCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn := integrationConn(t)
+	pub, err := NewPublisher(conn, DefaultPublisherConfig())
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+
+	origClose, origSlot := closeTimeout, channelSlotTimeout
+	closeTimeout, channelSlotTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { closeTimeout, channelSlotTimeout = origClose, origSlot })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- pub.Close() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the channel")
+	}
+}
+
+// TestIntegration_ConnectionCloseSurvivesUnresponsiveBroker is the connection
+// side, and the one that mattered most: unlike a channel's close, nothing was
+// left to notice the broker had gone quiet and fail the call for it — measured
+// still blocked after thirty seconds. Connection.Close holds the connection
+// lock throughout, so waiting there stops everything else on it too.
+func TestIntegration_ConnectionCloseSurvivesUnresponsiveBroker(t *testing.T) {
+	container := composeBrokerOrSkip(t)
+
+	conn, err := NewConnection(integrationConfig(t))
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+
+	orig := closeTimeout
+	closeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { closeTimeout = orig })
+
+	pauseBroker(t, container)
+	defer unpauseBroker(t, container)
+
+	done := make(chan error, 1)
+	go func() { done <- conn.Close() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on an unresponsive broker instead of abandoning the connection")
+	}
+}
+
+// composeBrokerOrSkip returns the compose broker's container name, skipping
+// when the suite is pointed somewhere else — pausing the wrong container would
+// prove nothing.
+func composeBrokerOrSkip(t *testing.T) string {
+	t.Helper()
+	if url := os.Getenv("RABBITMQ_URL"); url != "" && !strings.Contains(url, ":5672") {
+		t.Skip("needs the compose broker; RABBITMQ_URL points elsewhere")
+	}
+	const container = "rabbitwrap-rabbitmq-1"
+	if err := exec.Command("docker", "inspect", container).Run(); err != nil {
+		t.Skipf("needs the compose broker container %q", container)
+	}
+	return container
+}
+
+func pauseBroker(t *testing.T, container string) {
+	t.Helper()
+	if out, err := exec.Command("docker", "pause", container).CombinedOutput(); err != nil {
+		t.Skipf("cannot pause the broker: %v: %s", err, out)
+	}
+}
+
+func unpauseBroker(t *testing.T, container string) {
+	t.Helper()
+	if out, err := exec.Command("docker", "unpause", container).CombinedOutput(); err != nil {
+		t.Logf("could not unpause the broker: %v: %s", err, out)
+	}
+}
+
+// TestIntegration_ConsumerHelperFailureSparesConsumption pins the isolation the
+// separate channel buys. A declaration the broker refuses is answered by
+// closing the channel it arrived on; when that was the channel being consumed
+// on, a single bad call also stopped consumption and dropped whatever was
+// unacknowledged on it.
+func TestIntegration_ConsumerHelperFailureSparesConsumption(t *testing.T) {
+	conn := integrationConn(t)
+	queue := uniqueQueue(t)
+
+	consumer, err := NewConsumer(conn, DefaultConsumerConfig().
+		WithQueueConfig(DefaultQueueConfig(queue).WithDurable(true)))
+	if err != nil {
+		t.Fatalf("failed to create consumer: %v", err)
+	}
+	t.Cleanup(func() { consumer.Close(); deleteQueue(t, conn, queue) })
+
+	pub, err := NewPublisher(conn, DefaultPublisherConfig().WithRoutingKey(queue))
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	t.Cleanup(func() { pub.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deliveryCh, err := consumer.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start consumer: %v", err)
+	}
+	if err := pub.PublishText(ctx, "before"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "before")
+
+	consumer.mu.RLock()
+	consuming := consumer.channel
+	consumer.mu.RUnlock()
+
+	// Several refusals, so this cannot pass on the strength of one that raced.
+	for i := range 3 {
+		if err := consumer.BindQueue(queue, "exchange-that-does-not-exist", "k", nil); err == nil {
+			t.Fatalf("refusal %d: expected binding to a missing exchange to fail", i)
+		}
+	}
+
+	consumer.mu.RLock()
+	stillConsuming := consumer.channel
+	consumer.mu.RUnlock()
+	if stillConsuming != consuming {
+		t.Error("the consume channel was replaced, so a refused declaration reached it")
+	}
+	if consuming.ch.IsClosed() {
+		t.Error("the consume channel was closed by a refused declaration")
+	}
+
+	// The real check: it is still delivering, without having had to recover.
+	if err := pub.PublishText(ctx, "after"); err != nil {
+		t.Fatalf("publish after the refusals: %v", err)
+	}
+	recvDelivery(t, ctx, deliveryCh, "after")
+}
+
+// waitForReconnected waits for the connection to come back after a drop.
+func waitForReconnected(t *testing.T, conn *Connection) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !conn.IsHealthy() {
+		if time.Now().After(deadline) {
+			t.Fatal("connection never came back after being dropped")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // TestIntegration_PublisherReplacedChannelWaitsForCallInFlight is the publisher

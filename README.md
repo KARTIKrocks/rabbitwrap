@@ -429,6 +429,13 @@ A consumer consumes once: `Start` (and `Consume`) return `ErrAlreadyConsuming`
 if one is already running. Use `WithConcurrency` for parallel handlers, or a
 second consumer for a second subscription.
 
+Queue and exchange calls on a consumer — `DeclareQueue`, `BindQueue`,
+`PurgeQueue`, `DeclareExchange` and friends — run on a channel of the
+consumer's own, separate from the one it consumes on. So they keep working on a
+consumer that is idle or stopped, recovering by themselves after a channel
+error or a reconnect, and a declaration the broker refuses costs nothing but
+that call: consumption is not interrupted.
+
 `Stop()` unregisters the consumer at the broker, so a stopped consumer stops
 being counted and stops being routed to, and it can be started again:
 

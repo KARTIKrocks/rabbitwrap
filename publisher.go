@@ -643,7 +643,11 @@ func (p *Publisher) Close() error {
 		return ErrChannelBusy
 	}
 	defer p.rpcMu.Unlock()
-	return ch.Close()
+
+	// Bounded, because the call itself is synchronous: a broker that has gone
+	// quiet would otherwise hold Close for as long as the connection takes to
+	// notice, and with heartbeats off that is forever.
+	return closeChannelBounded(ch, p.log, "publisher: channel")
 }
 
 // IsClosed returns true if the publisher is closed.

@@ -75,6 +75,37 @@ var (
 // shorten it.
 var channelSlotTimeout = 5 * time.Second
 
+// closeTimeout bounds how long a close handshake — a channel's or the
+// connection's — is waited on before the thing being closed is abandoned. A
+// variable so tests can shorten it.
+var closeTimeout = 5 * time.Second
+
+// closeChannelBounded closes ch, giving up after closeTimeout. A channel.close
+// is a synchronous call, so a broker that has stopped answering would otherwise
+// block the caller — and the callers here are Close methods, which must return.
+// An abandoned channel is reclaimed when the connection closes. Returns the
+// close error, or nil when it was abandoned; what is logged on abandonment is
+// prefixed with what.
+//
+// Closes inside the background loops — setupChannel retiring the channel it
+// replaces, the topology refresh, the consume loop's failure path — are
+// deliberately left unbounded. Nobody is waiting on those to return, and the
+// connection noticing the dead peer unblocks them and triggers the reconnect
+// they were heading for anyway. It is the Close methods, which promise the
+// caller they will return, that have to be bounded.
+func closeChannelBounded(ch *Channel, log Logger, what string) error {
+	done := make(chan error, 1)
+	go func() { done <- ch.Close() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(closeTimeout):
+		log.Warnf("%s close timed out; it is released when the connection closes", what)
+		return nil
+	}
+}
+
 // acquireSlot takes mu, giving up after channelSlotTimeout rather than letting
 // an unresponsive broker hold the caller open forever. It reports whether the
 // lock was taken; the caller must unlock it if so.
@@ -574,7 +605,12 @@ func (c *Connection) Close() error {
 	c.log.Infof("closing connection")
 
 	if c.conn != nil {
-		return c.conn.Close()
+		// Bounded: connection.close is a synchronous call, and unlike a
+		// channel's there is nothing left to notice the broker has gone quiet
+		// and fail it — measured still blocked after 30 seconds against a
+		// paused broker. c.mu is held throughout, so an unbounded wait here
+		// stops everything else on the connection too.
+		return c.conn.CloseDeadline(time.Now().Add(closeTimeout))
 	}
 
 	return nil
