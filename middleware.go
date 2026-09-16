@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -16,8 +17,8 @@ type Middleware func(next MessageHandler) MessageHandler
 // Middleware is applied left-to-right: Chain(A, B, C)(handler) == A(B(C(handler))).
 func Chain(mw ...Middleware) Middleware {
 	return func(next MessageHandler) MessageHandler {
-		for i := len(mw) - 1; i >= 0; i-- {
-			next = mw[i](next)
+		for _, m := range slices.Backward(mw) {
+			next = m(next)
 		}
 		return next
 	}
@@ -161,6 +162,7 @@ func BackoffRetryMiddleware(pub DelayedPublisher, queue string, maxRetries int, 
 				// consumer's RequeueOnError. Wrapping ErrDrop (and keeping the
 				// original only as text) makes requeueDecision reject it, so it is
 				// dead-lettered if a DLX is configured, else discarded.
+				//nolint:errorlint // err is deliberately %v-only: only ErrDrop, not the original err, must satisfy errors.Is here.
 				return fmt.Errorf("rabbitmq: backoff retries (%d) exhausted: %v: %w", maxRetries, err, ErrDrop)
 			}
 
@@ -171,6 +173,7 @@ func BackoffRetryMiddleware(pub DelayedPublisher, queue string, maxRetries int, 
 				// failed): surface that failure while still applying the original
 				// error's disposition (kept in the chain via %w, so an ErrRequeue
 				// still requeues and a plain error still dead-letters/discards).
+				//nolint:errorlint // schedErr is deliberately %v-only: only err's own disposition (e.g. ErrRequeue) must satisfy errors.Is here.
 				return fmt.Errorf("rabbitmq: scheduling backoff retry failed: %v: %w", schedErr, err)
 			}
 			return nil

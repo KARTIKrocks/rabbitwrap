@@ -214,7 +214,7 @@ func (p *Publisher) acquireChannelSlot() bool {
 func (p *Publisher) setupChannel() error {
 	ch, err := p.conn.Channel()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrChannelClosed, err)
+		return fmt.Errorf("%w: %w", ErrChannelClosed, err)
 	}
 
 	if p.config.ConfirmMode {
@@ -411,7 +411,7 @@ func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey 
 
 	if !p.config.ConfirmMode {
 		if err := ch.ch.PublishWithContext(ctx, exchange, routingKey, p.config.Mandatory, p.config.Immediate, publishing); err != nil {
-			return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+			return fmt.Errorf("%w: %w", ErrPublishFailed, err)
 		}
 		return nil
 	}
@@ -422,7 +422,7 @@ func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey 
 	// waiter could otherwise consume another publish's ack/nack.
 	dc, err := ch.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, p.config.Mandatory, p.config.Immediate, publishing)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrPublishFailed, err)
+		return fmt.Errorf("%w: %w", ErrPublishFailed, err)
 	}
 
 	waitCtx := ctx
@@ -586,7 +586,7 @@ func (p *Publisher) declareDelayQueue(name, dlExchange, dlRoutingKey string, del
 
 	return p.withChannel(func(ch *Channel) error {
 		if _, err := ch.ch.QueueDeclare(name, true /*durable*/, false /*autoDelete*/, false /*exclusive*/, false /*noWait*/, args); err != nil {
-			return fmt.Errorf("%w: declare delay queue: %v", ErrPublishFailed, err)
+			return fmt.Errorf("%w: declare delay queue: %w", ErrPublishFailed, err)
 		}
 		return nil
 	})

@@ -16,7 +16,7 @@ Thank you for your interest in contributing!
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.27+
 - [golangci-lint](https://golangci-lint.run/welcome/install/)
 - A running RabbitMQ instance (for integration tests)
 

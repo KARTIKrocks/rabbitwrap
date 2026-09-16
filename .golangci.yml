@@ -1,5 +1,11 @@
 version: "2"
 
+# Report every occurrence. The defaults (max-same-issues: 3) hide duplicates,
+# which makes a lint failure look smaller than it is.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
   enable:
     - errcheck
@@ -11,6 +17,32 @@ linters:
     - gocritic
     - gocyclo
     - revive
+    - prealloc
+    # Security scanning matters for a package that manages network connections
+    # and credentials (AMQP URLs).
+    - gosec
+    # Error-handling discipline: %w-wrapped errors must be compared with
+    # errors.Is/As, and sentinel errors must be named Err*.
+    - errorlint
+    - errname
+    - nilerr
+    - nilnesserr
+    # Concurrency and context correctness matter here: CI runs with -race and
+    # Publish/Consume plumb ctx through to the broker round-trip.
+    - contextcheck
+    - fatcontext
+    - durationcheck
+    - perfsprint
+    - makezero
+    - wastedassign
+    - unconvert
+    - asasalint
+    - reassign
+    - usestdlibvars
+    - copyloopvar
+    - intrange
+    # Keep //nolint directives specific and explained.
+    - nolintlint
   settings:
     gocyclo:
       min-complexity: 15
@@ -18,6 +50,12 @@ linters:
       rules:
         - name: exported
           disabled: true
+    errcheck:
+      # An unchecked type assertion panics; deliberate `_ =` discards still pass.
+      check-type-assertions: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
   exclusions:
     rules:
       - linters:
@@ -25,8 +63,20 @@ linters:
         path: _test\.go
       - path: examples/
         text: ".*"
+      # Tests may assert on unwrapped errors, ignore teardown/setup errors,
+      # build strings without perfsprint's hot-path concern, and use plain
+      # counting loops for clarity; none of that ships to consumers.
+      - linters:
+          - errorlint
+          - gosec
+          - intrange
+          - perfsprint
+        path: _test\.go
 
 formatters:
   enable:
     - gofmt
     - goimports
+  settings:
+    gofmt:
+      simplify: true

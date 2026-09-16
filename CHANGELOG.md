@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Minimum Go version raised to 1.27.** `go.mod` now declares `go 1.27`;
+  building this module requires that toolchain or newer. CI tests against Go
+  1.27 only, replacing the 1.22–1.26 matrix.
+- **`.golangci.yml` gained a round of correctness/security linters**:
+  `prealloc`, `gosec`, `errorlint`, `errname`, `nilerr`, `nilnesserr`,
+  `contextcheck`, `fatcontext`, `durationcheck`, `perfsprint`, `makezero`,
+  `wastedassign`, `unconvert`, `asasalint`, `reassign`, `usestdlibvars`,
+  `copyloopvar`, `intrange`, and `nolintlint`; `golangci-lint` bumped to
+  v2.13.2. `gofmt`'s `simplify` is now on, and `errcheck` flags unchecked type
+  assertions.
+- **`Makefile` gained `tidy`, `tidy-check`, `lint-fix`, `fix`, and `vuln`
+  (govulncheck) targets**; `make ci` now also runs `vuln`. `golangci-lint` and
+  `goimports` tool pins bumped to match `.golangci.yml`.
+
+### Fixed
+
+- Modernized a handful of spots the Go 1.27 toolchain's `go fix`/modernize
+  analyzers flagged: a manual clamp-to-max in `reconnectDelay` now uses the
+  `min` builtin, three map-copy loops in `message.go` now use `maps.Copy`, and
+  `Chain`'s reverse iteration now uses `slices.Backward`. No behavior change.
+- `fmt.Errorf` calls that wrapped a sentinel error with `%w` but only
+  interpolated the underlying `err` with `%v` now wrap both, so callers can
+  `errors.Is`/`errors.As` against either. The two spots in
+  `BackoffRetryMiddleware` where that was deliberate (only `ErrDrop`/the
+  original error's disposition should match, not the wrapping cause) are left
+  as `%v` with a `//nolint:errorlint` explaining why.
+
 ## [0.16.0] - 2026-08-27
 
 ### Fixed
