@@ -45,3 +45,18 @@ updates:
     labels:
       - ci
     open-pull-requests-limit: 5
+
+  # docs.yml (on the website branch) pins its own actions/checkout,
+  # actions/setup-node, and Pages-deploy actions. Dependabot's github-actions
+  # ecosystem only scans the default branch's workflow files unless told
+  # otherwise, so without this entry those pins would never get a bump PR.
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: website
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - ci
+    open-pull-requests-limit: 5
