@@ -59,8 +59,12 @@ exclusive**, or the declaration fails with `Exception (541) INTERNAL_ERROR`.
   channel closing, mutex usage, and AMQP channel/connection recovery.
 - Wrap errors with context; never silently swallow them. Sentinel errors live in
   `rabbitmq.go`.
-- Pinned tool/broker versions must stay in sync across files:
-  - `golangci-lint` — `Makefile` (`GOLANGCI_LINT_VERSION`) ↔ `.github/workflows/ci.yml`.
-  - `goimports` — `Makefile` (`GOIMPORTS_VERSION`).
-  - RabbitMQ image — `docker-compose.yml` ↔ `.github/workflows/ci.yml`.
+- `Makefile` is the single source of truth for pinned tool versions
+  (`GOLANGCI_LINT_VERSION`, `GOIMPORTS_VERSION`, `GOVULNCHECK_VERSION`).
+  `.github/workflows/ci.yml` resolves `golangci-lint` and `govulncheck` from it
+  at run time (`make -s print-golangci-lint-version` /
+  `print-govulncheck-version`) rather than hardcoding a second copy, so bumping
+  a version only means editing the `Makefile`. `goimports` has no CI use, only
+  `make fmt`/`make setup`. The RabbitMQ image is the one pin that still needs
+  manual sync — `docker-compose.yml` ↔ `.github/workflows/ci.yml`.
 - Update `CHANGELOG.md` (Keep a Changelog format) for user-facing changes.
