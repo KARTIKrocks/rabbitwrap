@@ -1,25 +1,8 @@
-GOLANGCI_LINT_VERSION := v2.14.0
-GOIMPORTS_VERSION := v0.50.0
-GOVULNCHECK_VERSION := v1.8.0
+include common.mk
 
-.PHONY: all setup deps tidy tidy-check test test-v test-integration vet lint lint-fix fix build fmt cover clean ci vuln docker-up docker-down print-golangci-lint-version print-govulncheck-version
+.PHONY: all setup deps tidy tidy-check test test-v test-integration vet lint lint-fix fix build fmt cover clean ci vuln docker-up docker-down
 
 all: fmt vet lint test build
-
-## Install development tools (skips if already present)
-setup:
-	@command -v golangci-lint >/dev/null 2>&1 || { \
-		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
-		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
-	}
-	@command -v goimports >/dev/null 2>&1 || { \
-		echo "Installing goimports $(GOIMPORTS_VERSION)..."; \
-		go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION); \
-	}
-	@command -v govulncheck >/dev/null 2>&1 || { \
-		echo "Installing govulncheck $(GOVULNCHECK_VERSION)..."; \
-		go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
-	}
 
 ## Download module dependencies
 deps:
@@ -72,18 +55,6 @@ fix: fmt lint-fix
 ## database is fetched on every run.
 vuln: setup
 	govulncheck ./...
-
-## Print the pinned linter version. CI resolves golangci-lint-action's version
-## input from this rather than hardcoding a second copy of the number, so the
-## workflow and this file cannot drift apart.
-print-golangci-lint-version:
-	@echo $(GOLANGCI_LINT_VERSION)
-
-## Print the pinned scanner version. CI installs govulncheck with this rather
-## than hardcoding a second copy of the number, so the workflow and this file
-## cannot drift apart.
-print-govulncheck-version:
-	@echo $(GOVULNCHECK_VERSION)
 
 ## Build all packages
 build:
