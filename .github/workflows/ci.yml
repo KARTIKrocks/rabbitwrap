@@ -62,6 +62,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: "1.27"
+          # govulncheck also scans the standard library of the Go in use, so a cached older patch release fails on stdlib advisories already fixed.
+          check-latest: true
       - name: Install govulncheck
         run: go install "golang.org/x/vuln/cmd/govulncheck@$(make -s print-govulncheck-version)"
       - run: govulncheck ./...
