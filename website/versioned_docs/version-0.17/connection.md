@@ -90,8 +90,8 @@ conn.OnReconnectAborted(func(err error) {
 ```
 
 The error is `ErrMaxReconnects` when the attempt budget ran out, otherwise the
-rejected dial error wrapped with `ErrConnectionClosed` — use `errors.As` to
-reach its `*amqp.Error`, not a direct type assertion. Closing the connection yourself with `Close` is not an abort
+rejected dial error wrapped with `ErrConnectionClosed` — reach its
+`*amqp.Error` with `errors.As(err, &amqpErr)`, not a type assertion. Closing the connection yourself with `Close` is not an abort
 and does not fire the callback.
 
 ## Channel Recovery
