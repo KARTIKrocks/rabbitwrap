@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Godoc accuracy: `OnReconnectAborted` documents that a dial error arrives
+  wrapped with `ErrConnectionClosed` (use `errors.As`), and
+  `PublishDelayedToExchange` that the holding queue is keyed on the rounded
+  delay, not the requested one. No behavior change.
+
 ## [0.17.0] - 2026-11-02
 
 ### Changed

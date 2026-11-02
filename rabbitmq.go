@@ -567,8 +567,8 @@ func (c *Connection) OnDisconnect(fn func(error)) {
 // nothing further is retried afterwards.
 //
 // The error is the cause: ErrMaxReconnects when the attempt budget ran out,
-// otherwise the rejected dial error, which errors.As can unwrap to its
-// *amqp.Error. Handle this when a permanently dead connection means something
+// otherwise the rejected dial error wrapped with ErrConnectionClosed, so use
+// errors.As (not a type assertion) to reach its *amqp.Error. Handle this when a permanently dead connection means something
 // different from a brief outage — marking a service unready for good, alerting,
 // or exiting so a supervisor restarts with fresh credentials:
 //
