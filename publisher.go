@@ -538,7 +538,7 @@ func (p *Publisher) PublishDelayed(ctx context.Context, msg *Message, delay time
 // exchange and routing key only after the given delay. It is the arbitrary
 // destination form of PublishDelayed (which targets the publisher's configured
 // exchange/routing key); see PublishDelayed for the full mechanism and timing
-// semantics. Each distinct (exchange, routingKey, delay) uses its own holding
+// semantics. Each distinct (exchange, routingKey, rounded delay) uses its own holding
 // queue, so different destinations never share one.
 func (p *Publisher) PublishDelayedToExchange(ctx context.Context, exchange, routingKey string, msg *Message, delay time.Duration) error {
 	if msg == nil {
