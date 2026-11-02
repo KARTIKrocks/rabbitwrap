@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-02
+
 ### Changed
 
 - **Minimum Go version raised to 1.27.** `go.mod` now declares `go 1.27`;
@@ -17,11 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contextcheck`, `fatcontext`, `durationcheck`, `perfsprint`, `makezero`,
   `wastedassign`, `unconvert`, `asasalint`, `reassign`, `usestdlibvars`,
   `copyloopvar`, `intrange`, and `nolintlint`; `golangci-lint` bumped to
-  v2.13.2. `gofmt`'s `simplify` is now on, and `errcheck` flags unchecked type
+  v2.15.0. `gofmt`'s `simplify` is now on, and `errcheck` flags unchecked type
   assertions.
 - **`Makefile` gained `tidy`, `tidy-check`, `lint-fix`, `fix`, and `vuln`
-  (govulncheck) targets**; `make ci` now also runs `vuln`. `golangci-lint` and
-  `goimports` tool pins bumped to match `.golangci.yml`.
+  (govulncheck) targets**; `make ci` now also runs `vuln`. `golangci-lint`,
+  `goimports`, and `govulncheck` pins (now in `common.mk`, synced from
+  `go-build-tools`) bumped to match `.golangci.yml`.
+- **Dependency:** `github.com/rabbitmq/amqp091-go` bumped to v1.16.0. No API
+  or behaviour changes required in this library. `Dial` now surfaces the
+  broker's actual `connection.close` reason instead of a hardcoded 403, and
+  `ParseURI` rejects out-of-range heartbeat values, so a malformed
+  `?heartbeat=` in the connection URL now fails at parse time.
 
 ### Fixed
 
