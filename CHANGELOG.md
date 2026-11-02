@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Makefile` gained `tidy`, `tidy-check`, `lint-fix`, `fix`, and `vuln`
   (govulncheck) targets**; `make ci` now also runs `vuln`. `golangci-lint` and
   `goimports` tool pins bumped to match `.golangci.yml`.
+- **Dependency:** `github.com/rabbitmq/amqp091-go` bumped to v1.16.0. No API
+  or behaviour changes required in this library. `Dial` now surfaces the
+  broker's actual `connection.close` reason instead of a hardcoded 403, and
+  `ParseURI` rejects out-of-range heartbeat values, so a malformed
+  `?heartbeat=` in the connection URL now fails at parse time.
 
 ### Fixed
 
