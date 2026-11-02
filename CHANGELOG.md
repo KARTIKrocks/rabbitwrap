@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-02
+
 ### Changed
 
 - **Minimum Go version raised to 1.27.** `go.mod` now declares `go 1.27`;
