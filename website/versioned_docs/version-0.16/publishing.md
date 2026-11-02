@@ -69,8 +69,9 @@ whose queue-level TTL equals the delay and whose dead-letter routing points
 at the real destination, so it works on stock RabbitMQ. The delay is rounded
 **up** to the nearest rung of a fixed ladder (1s, 5s, 10s, 30s, 1m, 5m, 15m,
 30m, 1h — `rabbitmq.DelayLadder()`), so a message is never delivered early; a
-delay past the largest rung returns `ErrDelayTooLong`. Each distinct
-`(exchange, routingKey, delay)` shares one holding queue, auto-deleted by the
+delay past the largest rung returns `ErrDelayTooLong`, and a delay of zero or
+less publishes immediately. Each distinct `(exchange, routingKey, rung)` shares
+one holding queue, auto-deleted by the
 broker once idle.
 
 Timing is best-effort — at or shortly after the target, never before, with

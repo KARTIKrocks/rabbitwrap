@@ -24,8 +24,8 @@ make docker-up
 
 - `Connection` — safe for concurrent use
 - `Publisher` — safe for concurrent use
-- `Consumer` — use one goroutine per consumer; create multiple consumers for
-  parallel processing
+- `Consumer` — use one goroutine per consumer; set `WithConcurrency` for
+  parallel handlers, or create multiple consumers
 
 ## Contributing
 
