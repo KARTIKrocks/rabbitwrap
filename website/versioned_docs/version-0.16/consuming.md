@@ -84,8 +84,8 @@ deliveries, _ = consumer.Start(ctx) // registered again
 
 Two things follow from that. Stopping costs one round-trip. And an
 auto-delete queue is deleted when its last consumer goes away, so stopping
-the only consumer of one deletes it — use a durable queue for anything a
-stopped consumer should come back to.
+the only consumer of one deletes it — use a durable, non-auto-delete queue
+for anything a stopped consumer should come back to.
 
 By default each `Start` names its own subscription, which is what makes it
 cancellable: the broker will name one itself, but that name is never given

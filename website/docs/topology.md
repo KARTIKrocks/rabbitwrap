@@ -66,7 +66,8 @@ are consumed on. A consumer that declares no topology of its own never starts
 the refresh at all.
 
 Publishers need no equivalent: a publish to a missing exchange kills the
-publisher's channel, and re-establishing it re-declares the exchange.
+publisher's channel, and re-establishing it re-declares the exchange — but
+only one set with `WithExchangeConfig`, not one named only by `WithExchange`.
 
 Publishers take the same `WithExchangeConfig` option, which is worth using
 whenever the publisher may be the first one up:

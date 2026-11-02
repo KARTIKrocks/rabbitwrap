@@ -8,8 +8,6 @@ description: Install rabbitwrap and open a connection with logging and reconnect
 
 ## Installation
 
-Requires **Go 1.27+**.
-
 ```bash
 go get github.com/KARTIKrocks/rabbitwrap
 ```

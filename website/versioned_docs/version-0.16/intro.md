@@ -51,7 +51,3 @@ These guides explain concepts, patterns, and configuration. For exact type
 signatures, method sets, and struct fields, use
 [pkg.go.dev](https://pkg.go.dev/github.com/KARTIKrocks/rabbitwrap) — it is
 generated from the source and is always authoritative.
-
-## Requirements
-
-Go 1.22 or later.

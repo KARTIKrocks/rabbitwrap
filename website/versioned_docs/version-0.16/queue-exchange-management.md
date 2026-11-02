@@ -59,13 +59,13 @@ err = consumer.BindExchange("destination-exchange", "source-exchange", "routing.
 err = consumer.UnbindExchange("destination-exchange", "source-exchange", "routing.key", nil)
 ```
 
-:::caution Imperative calls share the channel
+:::caution Imperative calls are not retried
 
-**These imperative calls share the consumer's (or publisher's) channel.** A
-failed declare or bind — binding to a missing exchange, declaring over an
+A failed declare or bind — binding to a missing exchange, declaring over an
 exchange of a different type — is a channel-level exception: the broker
-closes the channel, which also interrupts consumption, and the call is never
-retried. Prefer the declarative
+closes the channel and the call is never retried. A consumer runs these on a
+separate channel, so consumption carries on and the next call reopens it; a
+publisher runs them on its own channel, so a failure interrupts publishing. Prefer the declarative
 [`WithExchangeConfig`/`WithQueueConfig`/`WithBinding`](./topology.md) options,
 which are applied on every channel setup and so also survive reconnects.
 

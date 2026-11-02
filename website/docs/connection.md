@@ -19,8 +19,9 @@ if err != nil {
 }
 defer conn.Close()
 
+// NewConnection has already connected, so OnConnect reports reconnects only.
 conn.OnConnect(func() {
-    log.Println("Connected to RabbitMQ")
+    log.Println("Reconnected to RabbitMQ")
 })
 
 conn.OnDisconnect(func(err error) {
@@ -88,9 +89,9 @@ conn.OnReconnectAborted(func(err error) {
 })
 ```
 
-The error is the cause, not a wrapper: `ErrMaxReconnects` when the attempt
-budget ran out, otherwise the rejected dial error, which `errors.As` unwraps to
-its `*amqp.Error`. Closing the connection yourself with `Close` is not an abort
+The error is `ErrMaxReconnects` when the attempt budget ran out, otherwise the
+rejected dial error wrapped with `ErrConnectionClosed` — reach its
+`*amqp.Error` with `errors.As(err, &amqpErr)`, not a type assertion. Closing the connection yourself with `Close` is not an abort
 and does not fire the callback.
 
 ## Channel Recovery
