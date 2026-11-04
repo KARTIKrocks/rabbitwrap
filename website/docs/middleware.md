@@ -22,11 +22,11 @@ consConfig := rabbitmq.DefaultConsumerConfig().
 
 ## Built-in Middleware
 
-| Middleware | Description |
-| --- | --- |
-| `LoggingMiddleware(logger)` | Logs message processing with duration |
-| `RecoveryMiddleware(onPanic)` | Recovers from panics in handlers |
-| `RetryMiddleware(maxRetries, delay)` | Retries failed processing in-process (short waits) |
+| Middleware                                             | Description                                                                                                                                     |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LoggingMiddleware(logger)`                            | Logs message processing with duration                                                                                                           |
+| `RecoveryMiddleware(onPanic)`                          | Recovers from panics in handlers                                                                                                                |
+| `RetryMiddleware(maxRetries, delay)`                   | Retries failed processing in-process (short waits)                                                                                              |
 | `BackoffRetryMiddleware(pub, queue, maxRetries, base)` | Retries at the broker with exponential backoff, freeing the slot — see [Dead-Letter Queues](./dead-letter-queues.md#broker-level-backoff-retry) |
 
 ## Custom Middleware

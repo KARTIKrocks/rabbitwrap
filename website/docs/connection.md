@@ -74,10 +74,10 @@ failures (network drops, broker restarts) keep retrying as normal.
 The two callbacks mean different things, and that is the whole point of
 keeping them separate:
 
-| Callback | Fires | Meaning |
-| --- | --- | --- |
-| `OnDisconnect` | once per lost connection, before retrying | briefly down, backing off |
-| `OnReconnectAborted` | at most once, when the loop gives up | gone for good — fix the credentials or restart |
+| Callback             | Fires                                     | Meaning                                        |
+| -------------------- | ----------------------------------------- | ---------------------------------------------- |
+| `OnDisconnect`       | once per lost connection, before retrying | briefly down, backing off                      |
+| `OnReconnectAborted` | at most once, when the loop gives up      | gone for good — fix the credentials or restart |
 
 ```go
 conn.OnReconnectAborted(func(err error) {
@@ -97,7 +97,7 @@ and does not fire the callback.
 ## Channel Recovery
 
 Losing the connection is not the only way to lose the ability to publish or
-consume. Any channel-level exception makes the broker close the *channel*
+consume. Any channel-level exception makes the broker close the _channel_
 while the connection stays healthy — publishing to an exchange that does not
 exist, an imperative `BindQueue` against a missing exchange, a declaration
 that conflicts with an existing one. Publishers and consumers watch for this
