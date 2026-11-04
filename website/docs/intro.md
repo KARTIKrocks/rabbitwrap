@@ -23,17 +23,17 @@ go get github.com/KARTIKrocks/rabbitwrap
 
 ## What you get
 
-| | |
-| --- | --- |
-| **Auto-reconnection** | Exponential backoff for connections, publishers, and consumers, with a distinct callback for a permanent give-up |
+|                          |                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Auto-reconnection**    | Exponential backoff for connections, publishers, and consumers, with a distinct callback for a permanent give-up                            |
 | **Declarative topology** | Exchanges, queues, and bindings restored after reconnects, and re-applied on a timer so a deleted binding cannot silently strand a consumer |
-| **Channel recovery** | A channel-level exception (not just a dropped connection) is caught and the channel re-established |
-| **Publisher confirms** | Correlated by delivery tag; a single confirmed publisher is safe to share across goroutines |
-| **Consumer middleware** | Logging, panic recovery, in-process retry, and broker-level backoff retry — or bring your own |
-| **Dead-letter queues** | One call wires the dead-letter exchange, queue, and binding for a work queue |
-| **Concurrent consumers** | Configurable worker goroutines with graceful, bounded shutdown |
-| **Health checks** | `conn.IsHealthy()` for readiness probes |
-| **Thread safe** | Connections and publishers safe for concurrent use |
+| **Channel recovery**     | A channel-level exception (not just a dropped connection) is caught and the channel re-established                                          |
+| **Publisher confirms**   | Correlated by delivery tag; a single confirmed publisher is safe to share across goroutines                                                 |
+| **Consumer middleware**  | Logging, panic recovery, in-process retry, and broker-level backoff retry — or bring your own                                               |
+| **Dead-letter queues**   | One call wires the dead-letter exchange, queue, and binding for a work queue                                                                |
+| **Concurrent consumers** | Configurable worker goroutines with graceful, bounded shutdown                                                                              |
+| **Health checks**        | `conn.IsHealthy()` for readiness probes                                                                                                     |
+| **Thread safe**          | Connections and publishers safe for concurrent use                                                                                          |
 
 ## Where to go next
 

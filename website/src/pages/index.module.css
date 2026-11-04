@@ -106,7 +106,6 @@
     border-block-end: 1px solid var(--ifm-toc-border-color);
   }
 
-  /* biome-ignore lint/style/noDescendingSpecificity: deliberate base-then-override order (general th/td above, narrower head/body overrides here), not a specificity bug. */
   & thead th {
     font-size: 0.75rem;
     font-weight: 600;
@@ -116,7 +115,6 @@
     white-space: nowrap;
   }
 
-  /* biome-ignore lint/style/noDescendingSpecificity: same deliberate override as thead th above. */
   & tbody th {
     font-weight: 400;
   }
